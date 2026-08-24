@@ -161,6 +161,33 @@ this in yet (that starts at Phase 6/10). 30 new tests
 `respx` to mock every GitHub response; zero real network calls in the
 test suite.
 
+## Branch resolution (Phase 6 — implemented)
+
+`app/services/repository_service.py::resolve_branch(provider, owner, repo,
+requested_branch)`:
+
+- `requested_branch=None` → returns the branch `GitHubProvider.list_branches`
+  marked `is_default=True` (derived from the repository's real
+  `default_branch` metadata field).
+- `requested_branch="some-name"` → returns that branch's `BranchInfo`
+  (including its `head_commit_sha`) or raises `BranchNotFoundError`
+  (`BRANCH_NOT_FOUND`) if it doesn't exist. Branch names are matched
+  case-sensitively, matching GitHub's own semantics.
+- Never silently substitutes a different branch than what was requested.
+
+This is provider-agnostic — it only calls `RepositoryProvider` interface
+methods, so it works unchanged for any future provider.
+
+Tested two ways:
+- `tests/test_repository_service.py` — unit tests against an in-memory
+  `StubProvider`, no network.
+- `tests/test_github_integration_live.py` — real integration tests against
+  `github.com/octocat/Hello-World` (metadata, branches, branch resolution,
+  bounded commit history, languages). Skipped by default; run explicitly
+  with `pytest --run-network` or `AURA_X_RUN_NETWORK_TESTS=1 pytest`, so
+  the default test run never depends on internet access. Verified passing
+  live as of Phase 6.
+
 ## Authentication
 
 `GITHUB_TOKEN` (optional, backend-only, `SecretStr`) — see

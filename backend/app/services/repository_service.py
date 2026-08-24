@@ -10,6 +10,10 @@ it works unchanged once GitLab/local providers exist.
 
 from __future__ import annotations
 
+import uuid
+from pathlib import Path
+
+from app.core.config import Settings
 from app.domain.errors import BranchNotFoundError
 from app.domain.models import BranchInfo
 from app.domain.repository_provider import RepositoryProvider
@@ -45,3 +49,15 @@ def resolve_branch(
             f"Branch '{requested_branch}' does not exist on {owner}/{repo}"
         )
     return branch
+
+
+def build_clone_target_dir(settings: Settings, owner: str, repo: str) -> str:
+    """Build a fresh, unique clone workspace path under `settings.workspace_root`.
+
+    Every call returns a distinct directory (even for the same repo) so
+    concurrent or repeated ingestions of the same repository can never
+    collide -- app/services/clone_service.py refuses to clone into a
+    directory that already exists.
+    """
+    unique = uuid.uuid4().hex
+    return str(Path(settings.workspace_root) / f"{owner}__{repo}__{unique}")

@@ -126,16 +126,12 @@ This matches expectations — Phase 0 was scoped to bootstrap only.
 - **No Alembic environment yet.** `alembic` is a declared dependency but
   unconfigured. Phase 9 must run `alembic init` and wire `env.py` to
   `app.db.base.Base.metadata` before the first migration.
-- **`gitpython` vs `subprocess` for cloning.** `requirements.txt` includes
-  `gitpython`, but the plan (Section 9) explicitly requires "argument
-  lists rather than shell interpolation" and tight control over timeouts/
-  size limits for security reasons. `GitPython` shells out to the `git`
-  binary internally and is generally safe when passed explicit argument
-  lists (not shell strings), but Phase 7 must confirm the specific clone
-  call keeps `shell=False` semantics and does not accept unsanitized
-  input into any single interpolated command string. Alternative: use
-  `subprocess.run(["git", "clone", ...])` directly for full control and a
-  smaller dependency surface — decide in Phase 7.
+- **`gitpython` vs `subprocess` for cloning — resolved in Phase 7.**
+  Went with `subprocess.run(["git", "clone", ...], shell=False)` directly
+  (`app/services/clone_service.py`) rather than `gitpython`, for full
+  control over the argument list, timeout, and workspace cleanup, and a
+  smaller dependency surface. `gitpython` is no longer a dependency
+  (removed from `requirements.txt`).
 - **`psycopg[binary]`** is a convenience wheel; fine for development, but
   worth revisiting for production (source build vs. binary) — not
   blocking for now.

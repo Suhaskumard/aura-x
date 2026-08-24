@@ -1,8 +1,8 @@
 # AURA-X GitHub Integration
 
 Living document. Updated at the end of every phase in
-`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 2
-(architecture design) and Phase 3 (RepositoryProvider abstraction).
+`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 7 (secure
+repository cloning).
 
 ## Architecture
 
@@ -42,7 +42,7 @@ Defined in `app/domain/repository_provider.py`. Abstract methods:
 | `list_branches(owner, repo)` | `list[BranchInfo]` | name + head commit sha |
 | `get_commit_history(owner, repo, branch, limit)` | `list[CommitInfo]` | bounded, newest first |
 | `get_languages(owner, repo)` | `dict[str, int]` | language → byte count, as reported by the provider |
-| `clone(context, target_dir)` | `CloneResult` | isolated, sandboxed, argument-list subprocess only (Phase 7) |
+| `clone(owner, repo, branch, target_dir)` | `CloneResult` | isolated, sandboxed, argument-list subprocess only (Phase 7 — implemented) |
 
 `GitHubProvider` (Phase 5+) implements this against the real GitHub REST
 API. It is the only class in the codebase allowed to import an HTTP client
@@ -61,10 +61,10 @@ dataclass — no ORM or GitHub SDK types leak into it, so downstream modules
 | `source_url` | `str` | user input, normalized |
 | `owner` | `str` | URL parsing (Phase 4) |
 | `repository_name` | `str` | URL parsing (Phase 4) |
-| `local_path` | `str \| None` | clone (Phase 7) |
+| `local_path` | `str \| None` | clone (Phase 7 — implemented) |
 | `selected_branch` | `str \| None` | branch resolution (Phase 6) |
 | `default_branch` | `str \| None` | metadata fetch (Phase 6) |
-| `commit_sha` | `str \| None` | clone verification (Phase 7) |
+| `commit_sha` | `str \| None` | clone verification (Phase 7 — implemented) |
 | `metadata` | `RepositoryMetadata \| None` | metadata fetch (Phase 6) |
 | `branches` | `list[BranchInfo]` | branch fetch (Phase 6) |
 | `languages` | `dict[str, int]` | language detection (Phase 8) |
@@ -148,7 +148,10 @@ Behavior:
 - `get_commit_history(branch, limit)` → `GET /repos/{owner}/{repo}/commits?sha={branch}`,
   bounded by `min(limit, settings.max_commit_history)`
 - `get_languages` → `GET /repos/{owner}/{repo}/languages`
-- `clone(...)` → raises `NotImplementedError`; implemented in Phase 7
+- `clone(owner, repo, branch, target_dir)` → delegates to
+  `app/services/clone_service.py::clone_repository`, passing the repo's
+  HTTPS clone URL (`https://github.com/{owner}/{repo}.git`) and, when
+  `settings.has_github_token()` is true, the token
 
 `GitHubProvider` self-registers for `github.com` and `www.github.com` when
 `app.services` is imported (`register_provider(...)` at module import
@@ -188,6 +191,80 @@ Tested two ways:
   the default test run never depends on internet access. Verified passing
   live as of Phase 6.
 
+## Secure repository cloning (Phase 7 — implemented)
+
+`app/services/clone_service.py::clone_repository(...)` is the **only**
+module allowed to invoke the `git` binary — mirrors the "one module owns
+the external boundary" rule already applied to `GitHubApiClient` for the
+REST API. Generic over its source (a `clone_url` string), so it has no
+GitHub-specific knowledge and any future provider (GitLab, local) can
+reuse it unchanged.
+
+Sandboxing, in the order it's applied:
+
+- **Argument-list only**: `subprocess.run([...], shell=False)`, never a
+  shell string — no argument (owner, repo, branch, or a token) can smuggle
+  a shell metacharacter.
+- **Workspace containment**: `target_dir` must resolve inside
+  `settings.workspace_root` and must not already exist (checked via
+  `Path.resolve()` + `is_relative_to`), or `CloneFailedError` is raised
+  before any subprocess runs. `app/services/repository_service.py::build_clone_target_dir(...)`
+  generates a fresh `{owner}__{repo}__{uuid4}` directory per clone so
+  concurrent or repeated ingestions of the same repo can never collide.
+- **Input validation**: `owner`/`repo` are re-validated against GitHub's
+  naming rules (`app/domain/github_url.py::validate_owner_repo`, shared
+  with URL parsing) and `branch` against a conservative ref-name allowlist
+  that rejects a leading `-` (would otherwise be parsed as a `git` flag —
+  e.g. `--upload-pack=...`) and `..`/backslash sequences. Validation
+  happens even though callers are expected to have already validated
+  upstream (defense in depth).
+- **Shallow, single-branch clone**: `--depth 1 --branch <branch>
+  --single-branch --no-tags`, bounding both clone time and history
+  fetched.
+- **Timeout**: `settings.clone_timeout_seconds`; on
+  `subprocess.TimeoutExpired` the partial workspace is removed and
+  `CloneFailedError` raised.
+- **Size limit**: after cloning, the workspace is walked and summed;
+  over `settings.max_repository_size_mb` removes the workspace and raises
+  `RepositoryTooLargeError`.
+- **Commit verification**: `git -C <target_dir> rev-parse HEAD` is run
+  and validated against a sha regex — `commit_sha` on the returned
+  `CloneResult` is the actually-cloned commit, not a value trusted from
+  the branch-resolution step, since the remote's branch head can move
+  between resolving the branch and finishing the clone.
+- **Token handling**: an optional GitHub token is passed as a
+  process-scoped `-c http.extraheader="AUTHORIZATION: bearer <token>"`
+  override — applies only to that one `git` invocation and is never
+  embedded in the clone URL or persisted into the cloned repository's
+  `.git/config` (verified by
+  `tests/test_clone_service.py::test_clone_does_not_write_token_into_cloned_repo_config`).
+  If a `git` failure's stderr happens to echo the token, it's redacted
+  before being placed in a `CloneFailedError` message
+  (`test_clone_failure_redacts_token_from_error`).
+- **Windows cleanup**: `git` leaves some files under `.git` read-only on
+  Windows; a plain `shutil.rmtree` aborts on the first one. `_safe_rmtree`
+  clears the read-only bit and retries via `onexc`/`onerror` so cleanup
+  always actually removes the partial workspace instead of silently
+  leaving it on disk.
+
+Tested in `tests/test_clone_service.py` against a real local git
+repository created with `git init`/`commit` in a pytest tmp dir (no
+network) — covers the happy path, workspace-containment rejection,
+already-exists rejection, invalid branch names (including a
+`--upload-pack=...` injection attempt), a nonexistent branch, the size
+limit, a mocked timeout, and token redaction/non-persistence. A real
+network clone against `github.com/octocat/Hello-World` is added to
+`tests/test_github_integration_live.py::test_clone_real_repository`
+(same `--run-network` gate as the rest of that file).
+`tests/test_github_provider.py` covers `GitHubProvider.clone`'s plumbing
+(HTTPS URL construction, token pass-through) against a mocked
+`clone_repository`, without touching git or the network.
+
+Not yet wired into an API route or the ingestion state machine — that
+starts at Phase 9/11, which will call `provider.clone(...)` after branch
+resolution and drive `RepositoryContext.transition_to(CLONING)` /
+`local_path` / `commit_sha` from the returned `CloneResult`.
+
 ## Authentication
 
 `GITHUB_TOKEN` (optional, backend-only, `SecretStr`) — see
@@ -198,31 +275,56 @@ Section "GitHub token" in the root `README.md`.
 
 - URL/path validation before any network or filesystem action (Phase 4).
 - Clone via argument-list subprocess calls only, never shell strings
-  (Phase 7).
-- Clone timeout, repository size limit, workspace isolation (Phase 7).
+  (Phase 7 — implemented, `app/services/clone_service.py`).
+- Clone timeout, repository size limit, workspace isolation (Phase 7 —
+  implemented).
 - No repository code is ever executed during ingestion.
 - Secrets never logged, never returned in API responses, never written to
   Excel (enforced by `SecretStr` + dedicated tests, see
-  `tests/test_health.py::test_health_check_never_leaks_token_value`).
+  `tests/test_health.py::test_health_check_never_leaks_token_value`); the
+  clone token is additionally never embedded in a URL or persisted to
+  `.git/config`, and is redacted from clone-failure error messages (Phase
+  7).
 
 ## Error handling
 
-Structured error codes introduced so far: none yet exercised in code
-(reserved names per the plan): `INVALID_REPOSITORY_URL`,
-`UNSUPPORTED_REPOSITORY_PROVIDER`, `REPOSITORY_NOT_FOUND`,
-`REPOSITORY_ACCESS_DENIED`, `RATE_LIMITED`, `TIMEOUT`,
-`UPSTREAM_UNAVAILABLE`, `MALFORMED_RESPONSE`. Defined starting Phase 4/5.
+Structured error codes and where each is currently raised:
+
+| Code | Raised by |
+|---|---|
+| `INVALID_REPOSITORY_URL` | `app/domain/github_url.py` (Phase 4) |
+| `UNSUPPORTED_REPOSITORY_PROVIDER` | `app/domain/github_url.py` (Phase 4) |
+| `REPOSITORY_NOT_FOUND` | reserved; not yet raised (Phase 9/11 route wiring) |
+| `REPOSITORY_ACCESS_DENIED` | `app/services/github_client.py` (Phase 5) |
+| `BRANCH_NOT_FOUND` | `app/services/repository_service.py::resolve_branch` (Phase 6) |
+| `RATE_LIMITED` | `app/services/github_client.py` (Phase 5) |
+| `TIMEOUT` | `app/services/github_client.py` (Phase 5) |
+| `UPSTREAM_UNAVAILABLE` | reserved; not yet raised |
+| `MALFORMED_RESPONSE` | `app/services/github_client.py` (Phase 5) |
+| `CLONE_FAILED` | `app/services/clone_service.py` (Phase 7) |
+| `REPOSITORY_TOO_LARGE` | `app/services/clone_service.py` (Phase 7) |
+| `INVALID_STATE_TRANSITION` | `app/domain/repository_context.py` (Phase 3) |
 
 ## Testing
 
-Phase 3 adds unit tests for `RepositoryContext` construction,
-serialization round-trip, and state-machine transitions
-(`backend/tests/test_repository_context.py`) — no network, no database.
+- `backend/tests/test_repository_context.py` — `RepositoryContext`
+  construction, serialization round-trip, state-machine transitions
+  (Phase 3). No network, no database.
+- `backend/tests/test_clone_service.py` — clone sandboxing against a real
+  local git repo (Phase 7). No network.
+- `backend/tests/test_github_integration_live.py` — real calls (metadata,
+  branches, commits, languages, clone) against
+  `github.com/octocat/Hello-World`. Skipped by default; run with
+  `pytest --run-network` or `AURA_X_RUN_NETWORK_TESTS=1 pytest`.
 
 ## Limitations (current)
 
-- Only `GitHubProvider` is planned; `LocalRepositoryProvider` and
+- Only `GitHubProvider` is implemented; `LocalRepositoryProvider` and
   `GitLabProvider` are named in the abstraction but not implemented.
-- No GitHub API calls exist yet — `RepositoryProvider` is an interface
-  only as of Phase 3.
 - No persistence — `RepositoryContext` is in-memory only until Phase 9.
+- No API route or ingestion orchestrator calls `resolve_branch`/`clone`
+  yet — that starts at Phase 9/11.
+- `clone()` always performs a shallow (`--depth 1`), single-branch clone;
+  full history is never fetched to disk (commit history for analysis
+  comes from the GitHub API, bounded by `max_commit_history`, not from the
+  local clone).

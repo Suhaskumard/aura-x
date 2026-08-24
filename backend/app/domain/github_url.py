@@ -32,6 +32,19 @@ class ParsedGitHubUrl:
     normalized_url: str
 
 
+def validate_owner_repo(owner: str, repo: str) -> None:
+    """Validate an (owner, repo) pair against GitHub's naming rules.
+
+    Shared by parse_github_url() and app/services/clone_service.py, which
+    must re-validate defensively since it can be called with a raw
+    (owner, repo, branch) tuple that never passed through URL parsing.
+    """
+    if not _OWNER_RE.match(owner):
+        raise InvalidRepositoryUrlError(f"Invalid repository owner: {owner!r}")
+    if repo.lower() in _RESERVED_REPO_NAMES or not _REPO_RE.match(repo):
+        raise InvalidRepositoryUrlError(f"Invalid repository name: {repo!r}")
+
+
 def parse_github_url(raw_url: str) -> ParsedGitHubUrl:
     """Validate and normalize a GitHub repository URL.
 
@@ -97,11 +110,7 @@ def parse_github_url(raw_url: str) -> ParsedGitHubUrl:
     if repo.endswith(".git"):
         repo = repo[: -len(".git")]
 
-    if not _OWNER_RE.match(owner):
-        raise InvalidRepositoryUrlError(f"Invalid repository owner: {owner!r}")
-
-    if repo.lower() in _RESERVED_REPO_NAMES or not _REPO_RE.match(repo):
-        raise InvalidRepositoryUrlError(f"Invalid repository name: {repo!r}")
+    validate_owner_repo(owner, repo)
 
     normalized_url = f"https://github.com/{owner}/{repo}"
     return ParsedGitHubUrl(owner=owner, repository=repo, normalized_url=normalized_url)

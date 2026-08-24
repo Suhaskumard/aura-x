@@ -7,9 +7,10 @@ provider-agnostic domain types in app/domain/models.py. Registered against
 get_provider_class_for_host() can resolve it -- see
 app/domain/repository_provider.py.
 
-clone() is implemented in Phase 7 (secure repository cloning); calling it
-here raises NotImplementedError with a clear message rather than silently
-doing something unsafe.
+clone() (Phase 7) delegates to app/services/clone_service.py -- the only
+module that invokes the `git` binary -- passing the repo's HTTPS clone URL
+and, when configured, the backend's GitHub token (never embedded in the
+URL; see clone_service for how it's passed and redacted on error).
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from datetime import datetime
 from app.core.config import Settings, get_settings
 from app.domain.models import BranchInfo, CloneResult, CommitInfo, RepositoryMetadata
 from app.domain.repository_provider import RepositoryProvider, register_provider
+from app.services.clone_service import clone_repository
 from app.services.github_client import GitHubApiClient
 
 
@@ -119,8 +121,19 @@ class GitHubProvider(RepositoryProvider):
         return dict(payload) if isinstance(payload, dict) else {}
 
     def clone(self, owner: str, repo: str, branch: str, target_dir: str) -> CloneResult:
-        raise NotImplementedError(
-            "GitHubProvider.clone() is implemented in Phase 7 (secure repository cloning)"
+        token = (
+            self._settings.github_token.get_secret_value()
+            if self._settings.has_github_token()
+            else None
+        )
+        return clone_repository(
+            clone_url=f"https://github.com/{owner}/{repo}.git",
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            target_dir=target_dir,
+            settings=self._settings,
+            token=token,
         )
 
 

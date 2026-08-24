@@ -154,8 +154,61 @@ def test_get_languages_returns_dict(settings):
     assert languages == {"Python": 12345, "HTML": 678}
 
 
-def test_clone_not_implemented_until_phase_7(settings):
-    provider = make_provider(settings)
-    with pytest.raises(NotImplementedError):
-        provider.clone("octocat", "hello-world", "main", "/tmp/somewhere")
-    provider.close()
+def test_clone_delegates_to_clone_service_with_https_url(settings, monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_clone_repository(**kwargs):
+        captured.update(kwargs)
+        from datetime import datetime, timezone
+
+        from app.domain.models import CloneResult
+
+        return CloneResult(
+            local_path=kwargs["target_dir"],
+            commit_sha="deadbeef",
+            branch=kwargs["branch"],
+            cloned_at=datetime.now(timezone.utc),
+        )
+
+    import app.services.github_provider as github_provider_module
+
+    monkeypatch.setattr(github_provider_module, "clone_repository", fake_clone_repository)
+
+    target_dir = str(tmp_path / "clone-target")
+    with make_provider(settings) as provider:
+        result = provider.clone("octocat", "hello-world", "main", target_dir)
+
+    assert captured["clone_url"] == "https://github.com/octocat/hello-world.git"
+    assert captured["owner"] == "octocat"
+    assert captured["repo"] == "hello-world"
+    assert captured["branch"] == "main"
+    assert captured["target_dir"] == target_dir
+    assert captured["token"] is None
+    assert result.commit_sha == "deadbeef"
+
+
+def test_clone_passes_configured_token(monkeypatch, tmp_path):
+    settings = Settings(github_token="secret-token-value")
+    captured = {}
+
+    def fake_clone_repository(**kwargs):
+        captured.update(kwargs)
+        from datetime import datetime, timezone
+
+        from app.domain.models import CloneResult
+
+        return CloneResult(
+            local_path=kwargs["target_dir"],
+            commit_sha="deadbeef",
+            branch=kwargs["branch"],
+            cloned_at=datetime.now(timezone.utc),
+        )
+
+    import app.services.github_provider as github_provider_module
+
+    monkeypatch.setattr(github_provider_module, "clone_repository", fake_clone_repository)
+
+    with make_provider(settings) as provider:
+        provider.clone("octocat", "hello-world", "main", str(tmp_path / "clone-target"))
+
+    assert captured["token"] == "secret-token-value"

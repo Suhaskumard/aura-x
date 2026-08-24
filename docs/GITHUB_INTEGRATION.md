@@ -110,11 +110,56 @@ in the system. 34 unit tests in `tests/test_github_url.py`, including a
 security matrix (path traversal, header injection, shell metacharacters,
 credential-in-URL, lookalike hosts).
 
-## GitHub API usage (Phase 5+)
+## GitHub API usage (Phase 5 — implemented)
 
-Not yet implemented. Will use: `GET /repos/{owner}/{repo}`,
-`GET /repos/{owner}/{repo}/branches`, `GET /repos/{owner}/{repo}/commits`,
-`GET /repos/{owner}/{repo}/commits/{sha}`, `GET /repos/{owner}/{repo}/languages`.
+`app/services/github_client.py::GitHubApiClient` is the **only** module
+allowed to call `api.github.com`. It wraps `httpx.Client` and implements:
+
+- `get_json(path)` — single-resource GET with retry/error translation.
+- `get_paginated(path, limit)` — follows the GitHub `Link` response header
+  (`rel="next"`) up to a caller-supplied item limit.
+
+Behavior:
+
+- **Timeouts**: `settings.github_request_timeout_seconds`, raises
+  `UpstreamTimeoutError` after exhausting `github_max_retries` attempts.
+- **Retries**: exponential backoff (capped at 2s) on timeouts, connection
+  errors, and `5xx` responses; `4xx` responses are never retried.
+- **Rate limiting**: a `403` with `X-RateLimit-Remaining: 0` raises
+  `RateLimitExceededError` including the reset time from
+  `X-RateLimit-Reset`; a `403` without those headers (private repo /
+  insufficient scope) raises `RepositoryAccessDeniedError` instead.
+- **Auth**: when `settings.has_github_token()` is true, sends
+  `Authorization: Bearer <token>` — the token is read once from
+  `SecretStr.get_secret_value()` and never logged or included in any
+  raised exception message.
+- **Malformed responses**: invalid JSON, or a paginated response that
+  isn't a JSON array, raises `MalformedUpstreamResponseError` rather than
+  propagating a `ValueError`/`TypeError`.
+
+`app/services/github_provider.py::GitHubProvider` implements
+`RepositoryProvider` on top of the client and maps raw GitHub JSON into
+`RepositoryMetadata`, `BranchInfo`, `CommitInfo`:
+
+- `fetch_metadata` → `GET /repos/{owner}/{repo}`
+- `list_branches` → fetches metadata (for `default_branch`) then
+  `GET /repos/{owner}/{repo}/branches`, marking the matching branch
+  `is_default=True`
+- `get_commit_history(branch, limit)` → `GET /repos/{owner}/{repo}/commits?sha={branch}`,
+  bounded by `min(limit, settings.max_commit_history)`
+- `get_languages` → `GET /repos/{owner}/{repo}/languages`
+- `clone(...)` → raises `NotImplementedError`; implemented in Phase 7
+
+`GitHubProvider` self-registers for `github.com` and `www.github.com` when
+`app.services` is imported (`register_provider(...)` at module import
+time), so `get_provider_class_for_host("github.com")` resolves it without
+any other module importing `GitHubProvider` directly.
+
+Not yet called from anywhere else in the app — no route or service wires
+this in yet (that starts at Phase 6/10). 30 new tests
+(`tests/test_github_client.py`, `tests/test_github_provider.py`) using
+`respx` to mock every GitHub response; zero real network calls in the
+test suite.
 
 ## Authentication
 

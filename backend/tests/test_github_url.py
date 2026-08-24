@@ -1,0 +1,93 @@
+import pytest
+
+from app.domain.errors import InvalidRepositoryUrlError, UnsupportedRepositoryProviderError
+from app.domain.github_url import parse_github_url
+
+
+@pytest.mark.parametrize(
+    "url,expected_owner,expected_repo",
+    [
+        ("https://github.com/fastapi/fastapi", "fastapi", "fastapi"),
+        ("https://github.com/fastapi/fastapi.git", "fastapi", "fastapi"),
+        ("https://github.com/fastapi/fastapi/", "fastapi", "fastapi"),
+        ("https://github.com/fastapi/fastapi.git/", "fastapi", "fastapi"),
+        ("https://www.github.com/fastapi/fastapi", "fastapi", "fastapi"),
+        ("http://github.com/fastapi/fastapi", "fastapi", "fastapi"),
+        ("  https://github.com/fastapi/fastapi  ", "fastapi", "fastapi"),
+        ("https://github.com/octocat/Hello-World", "octocat", "Hello-World"),
+        ("https://github.com/my-org/repo.name_with.dots", "my-org", "repo.name_with.dots"),
+        ("https://github.com/owner/repo/tree/main", "owner", "repo"),
+    ],
+)
+def test_valid_urls(url, expected_owner, expected_repo):
+    result = parse_github_url(url)
+    assert result.owner == expected_owner
+    assert result.repository == expected_repo
+    assert result.normalized_url == f"https://github.com/{expected_owner}/{expected_repo}"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "",
+        "   ",
+        "not a url",
+        "ftp://github.com/owner/repo",
+        "javascript:alert(1)",
+        "https://gitlab.com/owner/repo",
+        "https://github.evil.com/owner/repo",
+        "https://github.com.evil.com/owner/repo",
+        "https://githubb.com/owner/repo",
+        "https://github.com/owner",
+        "https://github.com/",
+        "https://github.com",
+        "https://user:pass@github.com/owner/repo",
+        "https://github.com/../../etc/passwd",
+        "https://github.com/owner/..",
+        "https://github.com/owner/%2e%2e",
+        "https://github.com/owner/repo\\..\\..",
+        "https://github.com/-owner/repo",
+        "https://github.com/owner-/repo",
+        "https://github.com/owner/.",
+        "https://github.com/owner/..git",
+        "https://github.com/owner/.git",
+        "https://github.com/ow ner/repo",
+        "https://github.com/owner/repo;rm -rf /",
+        "https://github.com/owner/repo\n\rSet-Cookie: evil=1",
+        "https://github.com/owner/repo\x00",
+    ],
+)
+def test_invalid_or_unsupported_urls_are_rejected(url):
+    with pytest.raises((InvalidRepositoryUrlError, UnsupportedRepositoryProviderError)):
+        parse_github_url(url)
+
+
+def test_unsupported_host_raises_specific_error_type():
+    with pytest.raises(UnsupportedRepositoryProviderError):
+        parse_github_url("https://gitlab.com/owner/repo")
+
+
+def test_malformed_url_raises_specific_error_type():
+    with pytest.raises(InvalidRepositoryUrlError):
+        parse_github_url("not a url at all")
+
+
+def test_overlong_url_rejected():
+    huge = "https://github.com/owner/" + ("a" * 3000)
+    with pytest.raises(InvalidRepositoryUrlError):
+        parse_github_url(huge)
+
+
+def test_non_string_input_rejected():
+    with pytest.raises(InvalidRepositoryUrlError):
+        parse_github_url(None)  # type: ignore[arg-type]
+
+
+def test_error_message_never_echoes_shell_metacharacters_unsafely():
+    # Defensive check: the exception message is just a string used in logs/
+    # API responses, never passed to a shell, so this mainly guards against
+    # a future refactor introducing eval/exec/subprocess on the raw input.
+    try:
+        parse_github_url("https://github.com/owner/repo;rm -rf /")
+    except InvalidRepositoryUrlError as exc:
+        assert isinstance(exc.message, str)

@@ -8,6 +8,7 @@ FastAPI app — see docs/GITHUB_INTEGRATION.md "Architecture".
 """
 
 from app.domain.errors import RepositoryIntegrationError
+from app.domain.github_url import ParsedGitHubUrl, parse_github_url
 from app.domain.models import (
     BranchInfo,
     CloneResult,
@@ -20,6 +21,8 @@ from app.domain.repository_provider import RepositoryProvider, get_provider_clas
 
 __all__ = [
     "RepositoryIntegrationError",
+    "ParsedGitHubUrl",
+    "parse_github_url",
     "BranchInfo",
     "CloneResult",
     "CommitInfo",

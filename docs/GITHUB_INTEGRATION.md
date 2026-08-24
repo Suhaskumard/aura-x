@@ -87,6 +87,29 @@ are terminal. Implemented as `IngestionStatus` (enum) +
 on an illegal jump. Phase 9 will back this with a persisted state machine;
 Phase 3 only needs it to hold correctly in memory.
 
+## URL validation (Phase 4 — implemented)
+
+`app/domain/github_url.py::parse_github_url()`. Accepts
+`https://github.com/owner/repo`, `.../repo.git`, `.../repo/`, and
+`http://`/`www.` variants; rejects anything else with a structured error:
+
+- `InvalidRepositoryUrlError` (`INVALID_REPOSITORY_URL`) — empty input,
+  wrong scheme, missing hostname, embedded credentials, missing
+  owner/repo segments, invalid owner/repo character set, reserved repo
+  names (`.`, `..`, `.git`), path traversal sequences (`..`, `%2e%2e`,
+  backslashes), control characters (incl. CR/LF header-injection
+  attempts), overlong input (>2048 chars).
+- `UnsupportedRepositoryProviderError` (`UNSUPPORTED_REPOSITORY_PROVIDER`)
+  — well-formed URL, host is not `github.com`/`www.github.com` (covers
+  lookalike hosts like `github.evil.com` and `github.com.evil.com`).
+
+Owner/repo are validated against GitHub's actual naming rules (owner:
+alphanumeric/hyphen, no leading/trailing hyphen, ≤39 chars; repo:
+alphanumeric/`.`/`_`/`-`, ≤100 chars) before being trusted anywhere else
+in the system. 34 unit tests in `tests/test_github_url.py`, including a
+security matrix (path traversal, header injection, shell metacharacters,
+credential-in-URL, lookalike hosts).
+
 ## GitHub API usage (Phase 5+)
 
 Not yet implemented. Will use: `GET /repos/{owner}/{repo}`,

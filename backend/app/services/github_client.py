@@ -135,6 +135,18 @@ class GitHubApiClient:
                 raise RepositoryAccessDeniedError(
                     "GitHub access denied (private repository or insufficient token scope)"
                 )
+            if response.status_code == 429:
+                # GitHub's secondary rate limit -- distinct from the primary
+                # limit's 403 above, and carries a Retry-After header
+                # (seconds) instead of/alongside X-RateLimit-Reset.
+                retry_after = response.headers.get("Retry-After")
+                if retry_after:
+                    raise RateLimitExceededError(
+                        f"GitHub API secondary rate limit exceeded, retry after {retry_after}s"
+                    )
+                raise RateLimitExceededError(
+                    f"GitHub API secondary rate limit exceeded, resets at {_rate_limit_reset_at(response)}"
+                )
             if response.status_code in _RETRYABLE_STATUS_CODES:
                 last_exc = None
                 if attempt >= max_attempts:

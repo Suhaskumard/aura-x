@@ -1,8 +1,8 @@
 # AURA-X GitHub Integration
 
 Living document. Updated at the end of every phase in
-`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 14
-(Excel reporting integration).
+`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 15
+(comprehensive test suite).
 
 ## Architecture
 
@@ -815,8 +815,11 @@ their real code and message rather than a generic "request failed."
 
 ### Verification
 
-No frontend test framework is configured in this project (`Phase 15`
-covers the test suite); this phase's own test requirement is a manual/
+No frontend test framework is configured in this project, and Phase 15's
+task list ("Comprehensive Test Suite") is entirely backend-focused (unit,
+API-client, git-integration, API, and security tests) with no frontend
+testing task in it -- automated frontend tests remain unscoped by any
+phase in the current plan. This phase's own test requirement is a manual/
 E2E browser walkthrough, which was performed for real: `npm run build`
 (TypeScript + Vite build, clean), the backend run against a temporary
 SQLite database (`alembic upgrade head`), and the dashboard driven in a
@@ -905,6 +908,104 @@ tested at the service layer; wiring it to a user-facing trigger is left
 for later, since neither the deliverable list nor the remaining phases
 (15 test suite, 16 end-to-end validation) allocate that to a specific
 phase.
+
+## Comprehensive Test Suite (Phase 15 — implemented)
+
+Every earlier phase already shipped its own tests as it landed (see each
+phase's own "Testing" section above) -- this phase's job was to check
+that against the plan's explicit coverage checklist, close the real gaps
+found, and add the one cross-cutting piece no single phase owned:
+end-to-end security verification. It also sets up the CI this project
+never had.
+
+### Gaps found and fixed
+
+- **`github_client.py` had no `429` handling.** GitHub's *secondary* rate
+  limit (distinct from the primary limit's `403`) can return `429`,
+  optionally with a `Retry-After` header. Before this phase, a `429`
+  fell through to the generic `>= 400` branch and raised
+  `UpstreamUnavailableError` -- the wrong error code, and not retried
+  the way `RateLimitExceededError` is meant to signal. Fixed in
+  `GitHubApiClient._request()`; covered by two new tests in
+  `tests/test_github_client.py` (with and without `Retry-After`).
+- **No test cloned a genuinely empty repository** (zero commits, so no
+  ref for `--branch` to resolve at all) -- a different failure mode from
+  "branch doesn't exist on an otherwise-normal repo," which was already
+  covered. Added `test_clone_fails_cleanly_for_empty_repository`.
+- **No test proved `--branch` actually selects a *different* branch's
+  content** -- every existing clone test only ever cloned `main`. Added
+  `test_clone_checks_out_the_requested_non_default_branch`, which clones
+  a second branch with a file that only exists there and asserts both
+  the file and the correct (different) commit SHA come back.
+- **No CI configuration existed at all** (`.github/workflows/` was
+  empty) -- see below.
+
+### `tests/test_security.py` -- the new cross-cutting suite
+
+Explicitly does not duplicate the security coverage already embedded in
+earlier phases' own test files (`test_github_url.py`'s URL matrix from
+Phase 4, `test_clone_service.py`'s sandboxing from Phase 7,
+`test_excel_export.py`'s credential check from Phase 14) -- it adds what
+none of them could on their own:
+
+- **End-to-end verification through the real API**, not just at the unit
+  that enforces a property: malicious/malformed URLs (unsupported
+  protocols, path traversal, embedded credentials, header injection,
+  null bytes) rejected with `400` and nothing persisted; a malicious
+  branch name never reaches the `git` subprocess (verified by
+  monkeypatching `subprocess.run` to fail the test if it's ever called --
+  the branch simply fails to match a real branch and the run ends
+  `FAILED`/`BRANCH_NOT_FOUND` before clone is ever reached); an oversized
+  repository surfaces `REPOSITORY_TOO_LARGE` end-to-end.
+- **Token-leakage checks across logs, error responses, and persisted
+  state together** -- the requirement the plan states explicitly and no
+  earlier phase's tests checked as one property. With a fake token
+  configured, a real ingestion failure is driven through the API and the
+  same fake token is asserted absent from: the HTTP response body, the
+  persisted `AnalysisRun.error_message`/`config_snapshot` in the
+  database, and every captured log record (`caplog` at `DEBUG`,
+  including `httpx`'s own request-logging). A further test simulates a
+  worst-case *compromised upstream* that echoes a secret-shaped string
+  back in its error body, proving the client's error messages never
+  forward a raw upstream response body regardless of what GitHub itself
+  sends.
+
+### CI
+
+`.github/workflows/backend-tests.yml` -- new. Two jobs:
+
+- **`test`** -- runs on every push/PR touching `backend/**`. Plain
+  `pytest -q`: offline-safe, no `--run-network`, matching how the suite
+  already behaves locally by default (`tests/conftest.py`'s
+  `pytest_collection_modifyitems` skips `@pytest.mark.network` tests
+  unless `--run-network`/`AURA_X_RUN_NETWORK_TESTS=1` is set).
+  `DATABASE_URL` is set to a throwaway SQLite file (the test suite builds
+  its own SQLite engine regardless via the `db_session` fixture, but a
+  real value avoids `Settings()` construction issues for any code path
+  that isn't test-scoped).
+- **`network-integration`** -- the opt-in network-integration tier the
+  deliverable asks for. `workflow_dispatch`-only (manual trigger via a
+  checkbox input), so a transient GitHub outage or rate limit never
+  blocks a normal push/PR. Runs `pytest -q --run-network`, optionally
+  using a `GITHUB_TOKEN_FOR_TESTS` repo/org secret to raise GitHub's
+  unauthenticated rate limit if needed.
+
+### Verification
+
+Full offline suite: **258 passed, 8 skipped** (`pytest -q`, no flags) --
+zero failures, zero network dependency. With `--run-network`: the two
+new network-tier-adjacent assertions in `test_security.py` don't touch
+GitHub directly, so they're unaffected; `tests/test_github_integration_
+live.py`'s six real-network tests were run and confirmed to fail with
+`RateLimitExceededError` at the time of this phase's work -- GitHub's
+unauthenticated 60-request/hour quota was already exhausted from Phase
+13's earlier browser walkthrough (verified directly: `GET
+api.github.com/rate_limit` showed `0/60` at the time). This is the exact
+environmental condition the "offline-safe by default" design exists to
+isolate away from the rest of the suite, not a regression -- the same
+six tests were confirmed passing earlier in this session (Phase 13) once
+the quota had reset, and `RATE_LIMITED` was itself the intended,
+correctly-classified error, not an unhandled exception.
 
 ## Authentication
 
@@ -1003,8 +1104,20 @@ Every code above maps to an HTTP status via a single table in
 - The dashboard (`frontend/`) has no automated tests -- no test framework
   is configured in this project yet (`vitest`/`@testing-library` are not
   installed); Phase 13's own test requirement is a manual/E2E browser
-  walkthrough, which was performed, not an automated suite. Automated
-  frontend tests are Phase 15's scope ("Comprehensive Test Suite").
+  walkthrough, which was performed, not an automated suite. Phase 15's
+  "Comprehensive Test Suite" task list is entirely backend-focused, so
+  automated frontend tests remain unscoped by any phase in the current
+  plan.
+- CI (`.github/workflows/backend-tests.yml`, Phase 15) has never actually
+  run on GitHub's infrastructure as of this writing -- it was authored
+  and its steps mirror exactly what was run locally (`pip install -r
+  requirements.txt && pytest -q`, confirmed green), but the workflow
+  file itself hasn't been exercised by a real push/PR/Actions run yet.
+- The network-integration tier's real target
+  (`github.com/octocat/Hello-World`) is unauthenticated in CI unless
+  `GITHUB_TOKEN_FOR_TESTS` is configured as a repo/org secret -- without
+  it, the same 60-request/hour quota this session hit locally applies
+  there too, and repeated manual runs of that workflow could hit it.
 - The dashboard doesn't send `Authorization` headers, so it only works
   against a backend with `api_auth_token` unset (the default). If that's
   configured, the dashboard has no UI to supply the token.

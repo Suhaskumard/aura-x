@@ -1,0 +1,73 @@
+name: Backend tests
+
+on:
+  push:
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-tests.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-tests.yml"
+  workflow_dispatch:
+    inputs:
+      run_network_tier:
+        description: "Also run the opt-in network-integration tier (real calls to github.com/octocat/Hello-World)"
+        type: boolean
+        default: false
+
+jobs:
+  # Offline-safe by default: no test in this job touches the network --
+  # GitHub's API is mocked (respx) and git integration tests clone from a
+  # local repo created on disk. Runs on every push/PR, no opt-in needed.
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run offline test suite
+        run: pytest -q
+        env:
+          # SQLite needs no external service; matches how these tests
+          # already run locally (see tests/conftest.py's db_session
+          # fixture, which ignores this and builds its own engine anyway)
+          DATABASE_URL: sqlite:///./ci.db
+
+  # Opt-in network-integration tier (this phase's plan explicitly asks for
+  # one): real calls against github.com/octocat/Hello-World (see
+  # tests/test_github_integration_live.py). Manual trigger only, so a
+  # transient GitHub outage or rate limit never blocks a normal push/PR.
+  network-integration:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_network_tier
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run full suite including the network tier
+        run: pytest -q --run-network
+        env:
+          DATABASE_URL: sqlite:///./ci.db
+          # Optional: set the GITHUB_TOKEN_FOR_TESTS repo/org secret to
+          # raise GitHub's unauthenticated rate limit (60/hour) if this
+          # job starts failing with RATE_LIMITED.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN_FOR_TESTS }}

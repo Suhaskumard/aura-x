@@ -79,6 +79,26 @@ def test_403_with_rate_limit_headers_raises_rate_limited(fast_settings):
 
 
 @respx.mock
+def test_429_with_retry_after_raises_rate_limited(fast_settings):
+    respx.get("https://api.github.com/repos/octocat/hello-world").mock(
+        return_value=httpx.Response(429, json={"message": "You have exceeded a secondary rate limit"}, headers={"Retry-After": "30"})
+    )
+    with GitHubApiClient(settings=fast_settings) as client:
+        with pytest.raises(RateLimitExceededError):
+            client.get_json("/repos/octocat/hello-world")
+
+
+@respx.mock
+def test_429_without_retry_after_raises_rate_limited(fast_settings):
+    respx.get("https://api.github.com/repos/octocat/hello-world").mock(
+        return_value=httpx.Response(429, json={"message": "You have exceeded a secondary rate limit"})
+    )
+    with GitHubApiClient(settings=fast_settings) as client:
+        with pytest.raises(RateLimitExceededError):
+            client.get_json("/repos/octocat/hello-world")
+
+
+@respx.mock
 def test_timeout_raises_upstream_timeout(fast_settings):
     respx.get("https://api.github.com/repos/octocat/hello-world").mock(
         side_effect=httpx.TimeoutException("timed out")

@@ -21,7 +21,7 @@ docs/       Architecture, audit, and planning documents
 
 ## Status
 
-**Phase 13 of 16 complete** (see the plan above for the full phase list).
+**Phase 15 of 16 complete** (see the plan above for the full phase list).
 GitHub repository ingestion is real end-to-end: paste a public repository
 URL in the dashboard and it validates the URL, fetches real metadata and
 branches, clones and scans the repository, detects languages/test
@@ -29,11 +29,15 @@ frameworks/dependencies, computes Git evolution signals, persists
 everything, and renders a live-updating Repository Profile — all backed
 by the REST API below, no mock data or hardcoded results anywhere in the
 path. Downstream analysis modules (Repository Intelligence, Evolution
-Analysis, Dependency Analysis, Risk Assessment, Test Planning) exist and
-are tested but not yet wired into the ingestion flow or exposed via the
-API (Phase 12); Excel reporting and the full test-suite/security pass are
-still ahead (Phases 14-16). See `docs/GITHUB_INTEGRATION.md` for the
-current, detailed state of every phase.
+Analysis, Dependency Analysis, Risk Assessment, Test Planning, Phase 12)
+and Excel export (Phase 14) exist and are tested but not yet wired into
+the ingestion flow or exposed via the API/dashboard. The backend test
+suite (unit, API-client, git-integration, API, and security tests,
+258 tests) is offline-safe by default with an opt-in network-integration
+tier, and runs in CI (`.github/workflows/backend-tests.yml`, Phase 15).
+Only Phase 16 (final end-to-end validation) remains. See
+`docs/GITHUB_INTEGRATION.md` for the current, detailed state of every
+phase.
 
 ## Backend setup
 
@@ -61,8 +65,15 @@ Run tests:
 
 ```bash
 cd backend
-pytest
+pytest              # offline-safe: no network access, no external DB
+pytest --run-network  # also runs the live-network tier against a real
+                       # small public repo (github.com/octocat/Hello-World)
 ```
+
+CI (`.github/workflows/backend-tests.yml`) runs the offline suite on
+every push/PR touching `backend/`; the network tier is a manual
+(`workflow_dispatch`) job so a transient GitHub outage or rate limit
+never blocks a normal push.
 
 ### GitHub token (optional)
 

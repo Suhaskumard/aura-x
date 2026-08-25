@@ -149,6 +149,59 @@ def test_clone_fails_for_nonexistent_branch(source_repo, settings):
     assert not target_dir.exists()
 
 
+def test_clone_fails_cleanly_for_empty_repository(settings, tmp_path):
+    # A repo with zero commits has no refs at all, so --branch <anything>
+    # cannot resolve -- this is a distinct failure mode from "branch
+    # doesn't exist on an otherwise-normal repo" (test_clone_fails_for_
+    # nonexistent_branch above), worth its own coverage since git's
+    # error path (and exit behavior) differs for a genuinely empty repo.
+    empty_source = tmp_path / "empty-source"
+    empty_source.mkdir()
+    _run_git("init", "--initial-branch=main", cwd=empty_source)
+    target_dir = settings.workspace_root / "acme__empty__1"
+
+    with pytest.raises(CloneFailedError):
+        clone_repository(
+            clone_url=str(empty_source),
+            owner="acme",
+            repo="empty",
+            branch="main",
+            target_dir=str(target_dir),
+            settings=settings,
+        )
+    assert not target_dir.exists()  # cleanup: no partial workspace left behind
+
+
+def test_clone_checks_out_the_requested_non_default_branch(source_repo, settings):
+    # All other clone tests only ever clone "main" -- this proves --branch
+    # actually selects a *different* branch's content and commit, not just
+    # accepting the argument without effect.
+    source, main_head = source_repo
+    _run_git("checkout", "-b", "feature", cwd=source)
+    (source / "feature.txt").write_text("only on feature\n", encoding="utf-8")
+    _run_git("add", "feature.txt", cwd=source)
+    _run_git("commit", "-m", "feature commit", cwd=source)
+    feature_head = subprocess.run(
+        ["git", "rev-parse", "feature"], cwd=source, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    target_dir = settings.workspace_root / "acme__widgets__feature"
+
+    result = clone_repository(
+        clone_url=str(source),
+        owner="acme",
+        repo="widgets",
+        branch="feature",
+        target_dir=str(target_dir),
+        settings=settings,
+    )
+
+    assert result.branch == "feature"
+    assert result.commit_sha == feature_head
+    assert result.commit_sha != main_head
+    assert (target_dir / "feature.txt").exists()
+    assert (target_dir / "feature.txt").read_text(encoding="utf-8") == "only on feature\n"
+
+
 def test_clone_enforces_size_limit_and_cleans_up(source_repo, settings):
     source, _ = source_repo
     settings.max_repository_size_mb = 0

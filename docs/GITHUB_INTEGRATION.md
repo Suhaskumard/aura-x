@@ -1,8 +1,9 @@
 # AURA-X GitHub Integration
 
 Living document. Updated at the end of every phase in
-`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 11
-(asynchronous status tracking).
+`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 12
+(connecting Repository Intelligence, Evolution Analysis, Dependency
+Analysis, Risk Assessment, and Test Planning).
 
 ## Architecture
 
@@ -23,6 +24,10 @@ Living document. Updated at the end of every phase in
    ▼             ▼                                       ▼
 Repository   Evolution / Risk / Test                 Reporting
 Intelligence     Planning                            (API / Dashboard / Excel)
+(app/analysis/, Phase 12)                             (partial: API is
+                                                        Phase 10/11;
+                                                        Dashboard/Excel
+                                                        not yet built)
 ```
 
 **Rule:** everything below the `RepositoryContext` line depends only on
@@ -30,7 +35,9 @@ Intelligence     Planning                            (API / Dashboard / Excel)
 `app/services` (Phase 5+) may import a GitHub-specific type or call the
 GitHub HTTP API directly. This is enforced by code review and by the
 provider factory being the only place that instantiates a concrete
-provider.
+provider. `app/analysis/` (Phase 12) follows the same rule from the
+consumer side: it imports `app.domain.RepositoryContext` and nothing
+GitHub-specific.
 
 ### RepositoryProvider interface
 
@@ -654,6 +661,107 @@ read-only `GET` endpoints are never gated, configured or not.
   pipeline (during `clone`, and separately during `fetch_metadata`)
   surfaces `FAILED` with the structured error and a set `completed_at` —
   not a silent hang.
+
+## Downstream analysis (Phase 12 — implemented)
+
+Per the architecture diagram at the top of this document, everything
+below the `RepositoryContext` line depends only on
+`app.domain.RepositoryContext` — never a GitHub-specific type, never a
+re-fetch, never a filesystem re-scan. Phase 12 adds those downstream
+consumers themselves (they didn't exist before this phase — see the
+Phase 1 audit) as a new top-level package, `app/analysis/`, deliberately
+separate from `app/services/` (the GitHub *integration* boundary: URL
+parsing, the API client, cloning, scanning, persistence).
+
+### Modules
+
+Every module exposes one entry point, `analyze(context: RepositoryContext,
+...) -> <Module>Report` — a frozen dataclass report, always carrying
+`repository_id`/`commit_sha` copied straight from `context`:
+
+- **`repository_intelligence.py`** — structural summary: language
+  breakdown (from `context.languages`), file counts by category, a
+  `size_classification` (`small`/`medium`/`large`, by file count — a
+  documented heuristic, not LOC), `has_readme`/`has_test_directory`, and
+  top-level directories. All from `context.file_tree`/`languages` —
+  no re-scan.
+- **`evolution_insights.py`** — interprets `context.evolution_signals`
+  (the churn/co-change/concentration data
+  `app/services/evolution_analysis.py` computed in Phase 8) into
+  hotspot files, tightly-coupled file pairs, and a `churn_pattern` read
+  (`none`/`concentrated`/`distributed`). Does no signal computation of
+  its own — this is the module the phase's exit criteria specifically
+  asks to "verify actually consumes" Phase 8's signals, so it's built to
+  be a thin, direct reader of them, not a parallel computation.
+- **`dependency_analysis.py`** — dependency inventory
+  (`app/services/dependency_scanner.py::extract_dependencies`, reading
+  `context.local_path` — already on the context from Phase 7's clone, not
+  a new input), plus which ecosystems are present (from `context.file_tree`
+  dependency-category files) and whether `requirements.txt` pins versions.
+- **`risk_assessment.py`** — combines Phase 8's per-file churn
+  (`context.evolution_signals.file_churn`) with a static "does a test
+  file's stem contain this source file's stem" heuristic (never executes
+  anything, never runs a real coverage tool — there is no code execution
+  anywhere in this pipeline) to flag high-churn, apparently-untested
+  source files as high risk. `overall_risk_score` is the high-risk share
+  of total observed churn.
+- **`planning.py`** (module file deliberately not named `test_planning.py`
+  — that would collide with pytest's `test_*.py` discovery glob and get
+  the module itself collected as a test file) — turns Risk Assessment's
+  high-risk files into concrete `TestRecommendation`s, naming the
+  already-detected framework (`context.test_frameworks`) in the reason
+  where one exists. Accepts an optional pre-computed `risk_report` (the
+  pipeline below passes one to avoid computing it twice) but still works
+  from `context` alone if omitted, computing it internally via
+  `risk_assessment.analyze(context)`.
+
+### Pipeline
+
+`app/analysis/pipeline.py::run_downstream_analysis(context)` runs all
+five in order and returns a `DownstreamAnalysisResult` bundling every
+report. Requires `context.analysis_status == READY` (raises `ValueError`
+otherwise) — "the **completed** RepositoryContext" per this phase's own
+framing; a context that never finished ingestion would produce
+misleadingly empty reports rather than a real analysis.
+
+Because every report's `repository_id`/`commit_sha` is copied directly
+from the single `context` passed in — never independently re-derived —
+consistent repository/branch/commit selection across every downstream
+stage (this phase's second task) is guaranteed by construction, not by a
+runtime cross-check.
+
+### Testing
+
+- `backend/tests/test_repository_intelligence.py`,
+  `test_evolution_insights.py`, `test_dependency_analysis.py`,
+  `test_risk_assessment.py`, `test_planning.py` — unit tests per module
+  against synthetic `RepositoryContext` fixtures (no clone, no network).
+- `backend/tests/test_analysis_pipeline.py` — the integration test this
+  phase's plan asks for: builds one real, fully-assembled `READY`
+  `RepositoryContext` (via Phase 8's `assemble_repository_context` against
+  a real on-disk fixture tree, same pattern as
+  `test_repository_context_assembly.py`) with a file churned across three
+  fixture commits and no matching test file, then runs
+  `run_downstream_analysis` and verifies: the same `repository_id`/
+  `commit_sha` appears unchanged on all five reports; Evolution's report
+  matches `context.evolution_signals` exactly (same hotspot, same churn
+  count — not recomputed or faked); and that same file flows all the way
+  through as Risk Assessment's top high-risk file and Test Planning's
+  recommendation, while a file with a matching test file does not. Also
+  covers dependency/ecosystem detection reading from the same
+  `local_path`, and the `READY`-only guard.
+
+### Not yet done
+
+Per the phase's own deliverable list ("downstream module entry points"
+only), Phase 12 stops at the service layer: `run_downstream_analysis` is
+not called from the ingestion job (Phase 11), not exposed via the API,
+and its reports aren't persisted. Nothing in the remaining plan (Phase
+13 Dashboard, Phase 14 Excel, Phase 15 test suite, Phase 16 end-to-end
+validation) allocates that wiring to a specific phase either — Phase 16's
+walkthrough explicitly ends with "hand off to downstream analysis" as
+the last step, matching this phase's scope of exposing the entry points
+without yet wiring them to run automatically.
 
 ## Authentication
 

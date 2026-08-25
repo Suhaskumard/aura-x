@@ -2,13 +2,34 @@ import os
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
 
+import app.models  # noqa: F401  (registers ORM models on Base.metadata)
+from app.db.base import Base
 from app.main import app
 
 
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(app)
+
+
+@pytest.fixture
+def db_session(tmp_path) -> Session:
+    """A fresh, file-backed SQLite database per test -- no Postgres/Docker
+    required. Same ORM models/constraints as production; only the engine
+    dialect differs (see docs/GITHUB_INTEGRATION.md 'Database Persistence'
+    for why the schema is written to be dialect-agnostic)."""
+    engine = create_engine(f"sqlite:///{tmp_path}/test.db", future=True)
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+    session = session_factory()
+    try:
+        yield session
+    finally:
+        session.close()
+        engine.dispose()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

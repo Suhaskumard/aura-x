@@ -1,9 +1,8 @@
 # AURA-X GitHub Integration
 
 Living document. Updated at the end of every phase in
-`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 8
-(constructing RepositoryContext: file inventory, language/test-framework
-detection, evolution signals).
+`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 9
+(database persistence).
 
 ## Architecture
 
@@ -74,7 +73,7 @@ dataclass — no ORM or GitHub SDK types leak into it, so downstream modules
 | `git_history` | `list[CommitInfo]` | commit history fetch (Phase 6); `changed_files` enriched for a bounded window (Phase 8 — implemented) |
 | `test_frameworks` | `list[str]` | test-framework detection (Phase 8 — implemented) |
 | `evolution_signals` | `EvolutionSignals \| None` | churn/co-change/concentration signals (Phase 8 — implemented) |
-| `analysis_status` | `IngestionStatus` | state machine (Phase 9/11) |
+| `analysis_status` | `IngestionStatus` | state machine (Phase 3); mirrored onto a persisted `AnalysisRun.status` (Phase 9 — implemented) |
 | `created_at` / `updated_at` | `datetime` | ingestion lifecycle |
 
 ### Ingestion state machine
@@ -88,8 +87,9 @@ PENDING → VALIDATING → FETCHING_METADATA → FETCHING_BRANCHES → CLONING �
 are terminal. Implemented as `IngestionStatus` (enum) +
 `ALLOWED_TRANSITIONS` in `app/domain/repository_context.py`; enforced by
 `RepositoryContext.transition_to(...)`, which raises `InvalidStateTransition`
-on an illegal jump. Phase 9 will back this with a persisted state machine;
-Phase 3 only needs it to hold correctly in memory.
+on an illegal jump. Phase 9 backs this with a persisted state machine on
+`AnalysisRun.status`, enforcing the same `ALLOWED_TRANSITIONS` allow-list
+-- see "Database Persistence" below.
 
 ## URL validation (Phase 4 — implemented)
 
@@ -264,9 +264,9 @@ network clone against `github.com/octocat/Hello-World` is added to
 (HTTPS URL construction, token pass-through) against a mocked
 `clone_repository`, without touching git or the network.
 
-Not yet wired into an API route or the ingestion state machine — that
-starts at Phase 9/11, which will call `provider.clone(...)` after branch
-resolution and drive `RepositoryContext.transition_to(CLONING)` /
+Not yet wired into an API route or an automated ingestion orchestrator —
+that starts at Phase 10/11, which will call `provider.clone(...)` after
+branch resolution and drive `RepositoryContext.transition_to(CLONING)` /
 `local_path` / `commit_sha` from the returned `CloneResult`.
 
 ## Constructing RepositoryContext (Phase 8 — implemented)
@@ -354,6 +354,121 @@ note that repo is intentionally a single extensionless `README`, so its
 detected languages can legitimately come back empty there — the
 non-empty case is covered by the synthetic-fixture unit tests instead.
 
+## Database Persistence (Phase 9 — implemented)
+
+Persists Repository/Branch/Commit/AnalysisRun using the project's existing
+SQLAlchemy/Alembic setup from Phase 0/1 -- no parallel storage system.
+
+### Schema
+
+Four tables, defined in `app/models/` (`Repository`, `Branch`, `Commit`,
+`AnalysisRun`), all built on the shared `app.db.base.Base`:
+
+- **`repositories`** — one row per `(provider, owner, name)`. Re-ingesting
+  an already-known repository updates this row in place (fresh metadata,
+  `updated_at` advanced) instead of creating a duplicate. Carries the
+  provider's own id (`provider_repository_id`) separately from the row's
+  own primary key, plus everything from `RepositoryMetadata`.
+- **`branches`** — the repository's *current* branch set (upserted by
+  name, stale branches removed on re-ingestion) — not a historical log.
+- **`commits`** — the bounded commit history that's been fetched for
+  analysis (mirrors `RepositoryContext.git_history`, including
+  `changed_files` where enriched per Phase 8). Upserted by `sha`, never
+  deleted, so a prior run's history stays retrievable even if a later run
+  fetches a different window.
+- **`analysis_runs`** — one row per ingestion attempt. Records exactly
+  which `branch_name` / `commit_sha` / `config_snapshot` (non-secret
+  settings: retry/timeout/size/history limits, evolution commit window --
+  never `github_token`) were used, its `status`, and, once `READY`, the
+  Repository Profile view (`result_profile`, Phase 8's
+  `build_repository_profile()` output) or, once `FAILED`, the structured
+  `error_code`/`error_message`.
+
+All primary keys are app-generated UUID strings (`String(36)`) rather
+than a database-native UUID type, and `analysis_runs.status` is a plain
+string (the same values as `IngestionStatus`) rather than a native DB
+enum -- both choices keep the schema dialect-agnostic so it runs
+unchanged against SQLite (used by every test in this suite, and a valid
+local-dev choice with no Docker/Postgres required) or Postgres
+(production; `DATABASE_URL` in `.env.example`).
+
+### Persisted state machine
+
+`app/db/repository_dao.py::transition_analysis_run(db, run, new_status)`
+enforces the *same* `ALLOWED_TRANSITIONS` allow-list
+(`app/domain/repository_context.py`) that governs the in-memory
+`RepositoryContext` (Phase 3) — a jump that's illegal in memory is
+equally rejected against the persisted row, and `completed_at` is set
+exactly when the run reaches `READY` or `FAILED`. `complete_analysis_run`
+and `fail_analysis_run` build on it to also write `result_profile` /
+`error_code`+`error_message` in the same step.
+
+### Repository (data-access) layer
+
+`app/db/repository_dao.py` is the only module that queries these tables —
+services accept an injected `Session` (`app.db.session.get_db`) and call
+into this module rather than issuing ad hoc queries. Functions:
+`get_repository_by_id`, `get_repository_by_identity`,
+`upsert_repository`, `upsert_branches`, `upsert_commits`,
+`create_analysis_run`, `get_analysis_run`,
+`list_analysis_runs_for_repository`, `transition_analysis_run`,
+`complete_analysis_run`, `fail_analysis_run`.
+
+`app/services/ingestion_persistence.py::persist_repository_context(db,
+context, config_snapshot=...)` is the bridge from Phase 8's finished
+`RepositoryContext` into this layer: upserts the repository/branches/
+commits, creates an `AnalysisRun`, and — since the only path to `READY`
+in `ALLOWED_TRANSITIONS` runs through every stage from `VALIDATING`
+onward in a fixed order, and this pipeline has no branching — replays
+that exact sequence on the persisted run before completing it, so the
+DB-side state machine is genuinely exercised rather than short-circuited.
+A `FAILED` context is recorded directly (`PENDING -> FAILED` is itself a
+valid transition) without claiming which stage it reached first.
+`build_config_snapshot(settings, evolution_commit_limit=...)` builds the
+non-secret config snapshot.
+
+Not yet called from an API route or background worker — that starts at
+Phase 10/11, which will call `assemble_repository_context` (Phase 8) then
+`persist_repository_context` (this module) in sequence per ingestion.
+
+### Migrations
+
+Alembic, initialized at `backend/alembic.ini` / `backend/migrations/`.
+`migrations/env.py` imports `app.models` (registering every model on
+`Base.metadata`) and sets `sqlalchemy.url` from
+`app.core.config.get_settings().database_url` — the connection string is
+never duplicated in `alembic.ini` itself, matching the "config boundary"
+rule the app already follows. The initial migration
+(`migrations/versions/..._initial_schema_phase_9.py`) was autogenerated
+from the models and verified to run both `upgrade head` and `downgrade
+base` cleanly against a throwaway SQLite database (no Postgres available
+in this environment to verify against directly; the schema uses no
+Postgres-specific types, so the same script applies unchanged there).
+
+### Testing
+
+- `backend/tests/test_analysis_run_state_machine.py` — valid transition
+  sequence accepted, invalid jumps rejected, `FAILED` reachable from any
+  non-terminal state, terminal states reject further transitions,
+  `completed_at`/`result_profile`/`error_code`+`error_message` set
+  correctly.
+- `backend/tests/test_repository_dao.py` — round-trip tests for each
+  table plus the full repository → branch → commit → analysis-run chain,
+  re-ingestion idempotency (same repository row, branches
+  updated/pruned, commits accumulated), and multiple analysis runs per
+  repository.
+- `backend/tests/test_ingestion_persistence.py` — `persist_
+  repository_context` end-to-end from a fully assembled `RepositoryContext`
+  (Phase 8) through to a persisted, re-readable `AnalysisRun`, covering
+  both the `READY` and `FAILED` outcomes and repeated ingestion of the
+  same repository.
+
+All of the above use `tests/conftest.py`'s `db_session` fixture — a
+fresh, file-backed SQLite database per test, created from
+`Base.metadata.create_all()` (not via Alembic, to keep the test suite
+fast and dependency-free); the Alembic migration itself is verified
+separately (see above), not by the pytest suite.
+
 ## Authentication
 
 `GITHUB_TOKEN` (optional, backend-only, `SecretStr`) — see
@@ -383,7 +498,7 @@ Structured error codes and where each is currently raised:
 |---|---|
 | `INVALID_REPOSITORY_URL` | `app/domain/github_url.py` (Phase 4) |
 | `UNSUPPORTED_REPOSITORY_PROVIDER` | `app/domain/github_url.py` (Phase 4) |
-| `REPOSITORY_NOT_FOUND` | reserved; not yet raised (Phase 9/11 route wiring) |
+| `REPOSITORY_NOT_FOUND` | reserved; not yet raised (Phase 10/11 route wiring) |
 | `REPOSITORY_ACCESS_DENIED` | `app/services/github_client.py` (Phase 5) |
 | `BRANCH_NOT_FOUND` | `app/services/repository_service.py::resolve_branch` (Phase 6) |
 | `RATE_LIMITED` | `app/services/github_client.py` (Phase 5) |
@@ -416,9 +531,13 @@ Structured error codes and where each is currently raised:
 
 - Only `GitHubProvider` is implemented; `LocalRepositoryProvider` and
   `GitLabProvider` are named in the abstraction but not implemented.
-- No persistence — `RepositoryContext` is in-memory only until Phase 9.
 - No API route or ingestion orchestrator calls `resolve_branch`/`clone`/
-  `assemble_repository_context` yet — that starts at Phase 9/11.
+  `assemble_repository_context`/`persist_repository_context` yet — that
+  starts at Phase 10/11.
+- The initial migration was verified against SQLite only (no Postgres
+  instance available in this environment); it uses no Postgres-specific
+  types, but running it against a real Postgres instance is still
+  recommended before Phase 9's persistence is relied on in production.
 - `clone()` always performs a shallow (`--depth 1`), single-branch clone;
   full history is never fetched to disk (commit history for analysis
   comes from the GitHub API, bounded by `max_commit_history`, not from the

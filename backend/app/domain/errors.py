@@ -73,5 +73,9 @@ class RepositoryTooLargeError(RepositoryIntegrationError):
     code = "REPOSITORY_TOO_LARGE"
 
 
+class RepositoryScanFailedError(RepositoryIntegrationError):
+    code = "REPOSITORY_SCAN_FAILED"
+
+
 class InvalidStateTransitionError(RepositoryIntegrationError):
     code = "INVALID_STATE_TRANSITION"

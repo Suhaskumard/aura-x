@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from enum import Enum
 
 from app.domain.errors import InvalidStateTransitionError
+from app.domain.evolution import EvolutionSignals
 from app.domain.models import BranchInfo, CommitInfo, FileEntry, RepositoryMetadata
 
 
@@ -60,6 +61,8 @@ class RepositoryContext:
     languages: dict[str, int] = field(default_factory=dict)
     file_tree: list[FileEntry] = field(default_factory=list)
     git_history: list[CommitInfo] = field(default_factory=list)
+    test_frameworks: list[str] = field(default_factory=list)
+    evolution_signals: EvolutionSignals | None = None
 
     analysis_status: IngestionStatus = IngestionStatus.PENDING
     last_error: dict | None = None

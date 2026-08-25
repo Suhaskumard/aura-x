@@ -1,8 +1,9 @@
 # AURA-X GitHub Integration
 
 Living document. Updated at the end of every phase in
-`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 7 (secure
-repository cloning).
+`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 8
+(constructing RepositoryContext: file inventory, language/test-framework
+detection, evolution signals).
 
 ## Architecture
 
@@ -42,6 +43,7 @@ Defined in `app/domain/repository_provider.py`. Abstract methods:
 | `list_branches(owner, repo)` | `list[BranchInfo]` | name + head commit sha |
 | `get_commit_history(owner, repo, branch, limit)` | `list[CommitInfo]` | bounded, newest first |
 | `get_languages(owner, repo)` | `dict[str, int]` | language → byte count, as reported by the provider |
+| `get_commit_file_changes(owner, repo, sha)` | `list[FileChange]` | per-file additions/deletions/status for one commit; not in the bulk commit-list response, so callers fetch it for a bounded window of commits (Phase 8 — implemented) |
 | `clone(owner, repo, branch, target_dir)` | `CloneResult` | isolated, sandboxed, argument-list subprocess only (Phase 7 — implemented) |
 
 `GitHubProvider` (Phase 5+) implements this against the real GitHub REST
@@ -67,9 +69,11 @@ dataclass — no ORM or GitHub SDK types leak into it, so downstream modules
 | `commit_sha` | `str \| None` | clone verification (Phase 7 — implemented) |
 | `metadata` | `RepositoryMetadata \| None` | metadata fetch (Phase 6) |
 | `branches` | `list[BranchInfo]` | branch fetch (Phase 6) |
-| `languages` | `dict[str, int]` | language detection (Phase 8) |
-| `file_tree` | `list[FileEntry]` | repository scan (Phase 8) |
-| `git_history` | `list[CommitInfo]` | commit history fetch (Phase 6) |
+| `languages` | `dict[str, int]` | language detection (Phase 8 — implemented) |
+| `file_tree` | `list[FileEntry]` | repository scan (Phase 8 — implemented) |
+| `git_history` | `list[CommitInfo]` | commit history fetch (Phase 6); `changed_files` enriched for a bounded window (Phase 8 — implemented) |
+| `test_frameworks` | `list[str]` | test-framework detection (Phase 8 — implemented) |
+| `evolution_signals` | `EvolutionSignals \| None` | churn/co-change/concentration signals (Phase 8 — implemented) |
 | `analysis_status` | `IngestionStatus` | state machine (Phase 9/11) |
 | `created_at` / `updated_at` | `datetime` | ingestion lifecycle |
 
@@ -265,6 +269,91 @@ starts at Phase 9/11, which will call `provider.clone(...)` after branch
 resolution and drive `RepositoryContext.transition_to(CLONING)` /
 `local_path` / `commit_sha` from the returned `CloneResult`.
 
+## Constructing RepositoryContext (Phase 8 — implemented)
+
+Turns a cloned working tree + already-fetched API metadata into the fully
+populated `RepositoryContext` the rest of AURA-X consumes. Each concern is
+its own small, pure/read-only module under `app/services/`:
+
+- **`file_scanner.py::scan_repository_tree(root)`** — walks the cloned
+  tree and returns `list[FileEntry]`. Excludes `.git`, `node_modules`,
+  virtualenvs, build/cache directories, and anything matched by the
+  repo's own top-level `.gitignore`; skips oversized files
+  (`DEFAULT_MAX_FILE_SIZE_BYTES` = 5MB) and binary files (known binary
+  extension, or a null byte in the first 8KB). Symlinks are skipped
+  entirely. Categorizes each file as `source | test | docs | config |
+  build | dependency | other` from its path/extension.
+- **`language_map.py`** — shared extension→language and manifest→language
+  tables used by both modules below.
+- **`language_detector.py::detect_languages(file_tree, github_languages)`**
+  — merges GitHub's reported byte counts (authoritative when present)
+  with extension-based totals from the scanned tree, plus a zero-count
+  entry for any language implied by a dependency manifest
+  (`requirements.txt`, `package.json`, ...) that wasn't otherwise seen.
+  This keeps languages non-empty even when GitHub's linguist data is thin
+  or a future provider has no language API at all.
+- **`test_framework_detector.py::detect_test_frameworks(root, file_tree)`**
+  / **`detect_test_directories(file_tree)`** — static, read-only
+  detection (config file presence: `pytest.ini`, `conftest.py`,
+  `tox.ini`, `noxfile.py`, `jest.config.*`, `vitest.config.*`,
+  `.mocharc*`; or a declared dependency in `package.json` /
+  `requirements*.txt` / `pyproject.toml` / `setup.cfg`). Deliberately
+  does **not** infer a framework merely from `test_*.py`-shaped file
+  names (equally consistent with plain stdlib `unittest`) — only reports
+  what there's direct evidence for. Never imports or executes anything
+  from the scanned repository.
+- **`evolution_analysis.py::compute_evolution_signals(commits)`** — pure
+  function over `list[CommitInfo]` producing `EvolutionSignals`
+  (`app/domain/evolution.py`): per-file churn (change count +
+  aggregated additions/deletions + last-changed timestamp, sorted
+  hottest-first), recently-changed files (newest-commit-first, deduped),
+  co-changing file pairs (files that appear together in the same commit
+  more than once, top-N by co-change count), and a change-concentration
+  ratio (share of total churn held by the top ~20% most-changed files).
+- **`dependency_scanner.py::extract_dependencies(root)`** — best-effort
+  dependency name list from `requirements*.txt` / `package.json` at the
+  repo root, for the Repository Profile view only (not consumed by
+  Evolution/Risk).
+
+Orchestration lives in `app/services/repository_service.py`:
+
+- **`enrich_commit_history(provider, owner, repo, commits, limit=30)`** —
+  `get_commit_history` (Phase 6) doesn't include per-file diffs (GitHub's
+  commit-*list* endpoint doesn't return them). This fetches
+  `provider.get_commit_file_changes(...)` for up to `limit` of the most
+  recent commits (one extra API call each) and returns commits with
+  `changed_files` populated; commits beyond the limit, or that already
+  carry `changed_files`, pass through unchanged.
+- **`assemble_repository_context(context, provider, evolution_commit_limit=30)`**
+  — expects `context` already in `CLONING` with `local_path`, `metadata`,
+  `branches`, and `git_history` set (Phase 5/6/7). Transitions to
+  `SCANNING`, scans the tree, detects languages and test frameworks,
+  enriches + analyzes commit history, and transitions to `READY` — or to
+  `FAILED` with a structured `last_error` (`REPOSITORY_SCAN_FAILED` if
+  `local_path` is missing; any other `RepositoryIntegrationError`
+  otherwise). Mutates and returns `context`.
+- **`build_repository_profile(context) -> dict`** — the "Repository
+  Profile view" deliverable: identity, metadata, branch, commit SHA,
+  languages, test frameworks + test directories, dependencies, a file
+  inventory summary (count/size/by-category), and a git history summary.
+  Never includes `local_path` (filesystem path) or a secret.
+
+Not yet wired into an API route — that starts at Phase 10/11, which will
+call `assemble_repository_context` after `provider.clone(...)` and expose
+`build_repository_profile` via `/repositories/{id}`.
+
+Tested in `tests/test_file_scanner.py`, `tests/test_language_detector.py`,
+`tests/test_test_framework_detector.py`, `tests/test_evolution_analysis.py`,
+`tests/test_dependency_scanner.py` (all synthetic fixtures, no network),
+and `tests/test_repository_context_assembly.py` (orchestration, using a
+real on-disk fixture tree + an in-memory fake provider). A
+`--run-network` end-to-end test against `octocat/Hello-World` is added to
+`tests/test_github_integration_live.py`
+(`test_assemble_repository_context_end_to_end_against_real_repository`);
+note that repo is intentionally a single extensionless `README`, so its
+detected languages can legitimately come back empty there — the
+non-empty case is covered by the synthetic-fixture unit tests instead.
+
 ## Authentication
 
 `GITHUB_TOKEN` (optional, backend-only, `SecretStr`) — see
@@ -303,6 +392,7 @@ Structured error codes and where each is currently raised:
 | `MALFORMED_RESPONSE` | `app/services/github_client.py` (Phase 5) |
 | `CLONE_FAILED` | `app/services/clone_service.py` (Phase 7) |
 | `REPOSITORY_TOO_LARGE` | `app/services/clone_service.py` (Phase 7) |
+| `REPOSITORY_SCAN_FAILED` | `app/services/repository_service.py::assemble_repository_context` (Phase 8) |
 | `INVALID_STATE_TRANSITION` | `app/domain/repository_context.py` (Phase 3) |
 
 ## Testing
@@ -313,18 +403,31 @@ Structured error codes and where each is currently raised:
 - `backend/tests/test_clone_service.py` — clone sandboxing against a real
   local git repo (Phase 7). No network.
 - `backend/tests/test_github_integration_live.py` — real calls (metadata,
-  branches, commits, languages, clone) against
+  branches, commits, languages, clone, scan, and full
+  `assemble_repository_context` end-to-end) against
   `github.com/octocat/Hello-World`. Skipped by default; run with
   `pytest --run-network` or `AURA_X_RUN_NETWORK_TESTS=1 pytest`.
+- `backend/tests/test_file_scanner.py`, `test_language_detector.py`,
+  `test_test_framework_detector.py`, `test_evolution_analysis.py`,
+  `test_dependency_scanner.py`, `test_repository_context_assembly.py` —
+  Phase 8 unit + orchestration tests, synthetic fixtures, no network.
 
 ## Limitations (current)
 
 - Only `GitHubProvider` is implemented; `LocalRepositoryProvider` and
   `GitLabProvider` are named in the abstraction but not implemented.
 - No persistence — `RepositoryContext` is in-memory only until Phase 9.
-- No API route or ingestion orchestrator calls `resolve_branch`/`clone`
-  yet — that starts at Phase 9/11.
+- No API route or ingestion orchestrator calls `resolve_branch`/`clone`/
+  `assemble_repository_context` yet — that starts at Phase 9/11.
 - `clone()` always performs a shallow (`--depth 1`), single-branch clone;
   full history is never fetched to disk (commit history for analysis
   comes from the GitHub API, bounded by `max_commit_history`, not from the
   local clone).
+- `enrich_commit_history` only fetches per-file diffs for the most recent
+  `evolution_commit_limit` (default 30) commits — one GitHub API call
+  each — to bound request volume; evolution signals for large histories
+  are computed over that recent window, not the full history.
+- Dependency extraction (`dependency_scanner.py`) is best-effort name-only
+  parsing of `requirements*.txt`/`package.json`; it doesn't resolve
+  lockfiles, transitive dependencies, or other ecosystems (Maven, Cargo,
+  Go modules) yet.

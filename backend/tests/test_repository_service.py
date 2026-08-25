@@ -1,7 +1,7 @@
 import pytest
 
 from app.domain.errors import BranchNotFoundError
-from app.domain.models import BranchInfo, CloneResult, CommitInfo, RepositoryMetadata
+from app.domain.models import BranchInfo, CloneResult, CommitInfo, FileChange, RepositoryMetadata
 from app.domain.repository_provider import RepositoryProvider
 from app.services.repository_service import resolve_branch
 
@@ -22,6 +22,9 @@ class StubProvider(RepositoryProvider):
         raise NotImplementedError
 
     def get_languages(self, owner: str, repo: str) -> dict[str, int]:
+        raise NotImplementedError
+
+    def get_commit_file_changes(self, owner: str, repo: str, sha: str) -> list[FileChange]:
         raise NotImplementedError
 
     def clone(self, owner, repo, branch, target_dir) -> CloneResult:

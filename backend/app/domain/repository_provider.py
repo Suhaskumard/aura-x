@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from app.domain.models import BranchInfo, CloneResult, CommitInfo, RepositoryMetadata
+from app.domain.models import BranchInfo, CloneResult, CommitInfo, FileChange, RepositoryMetadata
 
 
 class RepositoryProvider(ABC):
@@ -35,6 +35,15 @@ class RepositoryProvider(ABC):
 
     @abstractmethod
     def get_languages(self, owner: str, repo: str) -> dict[str, int]:
+        ...
+
+    @abstractmethod
+    def get_commit_file_changes(self, owner: str, repo: str, sha: str) -> list[FileChange]:
+        """Per-file additions/deletions/status for a single commit. Not
+        included in get_commit_history's bulk listing (Phase 6) -- callers
+        that need this for evolution analysis (Phase 8) fetch it for a
+        bounded subset of commits, see
+        app/services/repository_service.py::enrich_commit_history."""
         ...
 
     @abstractmethod

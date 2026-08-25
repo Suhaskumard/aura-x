@@ -15,8 +15,16 @@ import shutil
 import pytest
 
 from app.core.config import Settings
+from app.domain.repository_context import IngestionStatus, RepositoryContext
+from app.services.file_scanner import scan_repository_tree
 from app.services.github_provider import GitHubProvider
-from app.services.repository_service import build_clone_target_dir, resolve_branch
+from app.services.language_detector import detect_languages
+from app.services.repository_service import (
+    assemble_repository_context,
+    build_clone_target_dir,
+    build_repository_profile,
+    resolve_branch,
+)
 
 OWNER = "octocat"
 REPO = "Hello-World"
@@ -84,5 +92,66 @@ def test_clone_real_repository(live_provider, live_settings):
         assert result.commit_sha
         assert result.branch == branch.name
         assert Path(result.local_path).is_dir()
+    finally:
+        shutil.rmtree(target_dir, ignore_errors=True)
+
+
+@pytest.mark.network
+def test_scan_real_cloned_repository_produces_nonempty_file_tree(live_provider, live_settings):
+    branch = resolve_branch(live_provider, OWNER, REPO, None)
+    target_dir = build_clone_target_dir(live_settings, OWNER, REPO)
+    try:
+        clone_result = live_provider.clone(OWNER, REPO, branch.name, target_dir)
+        file_tree = scan_repository_tree(clone_result.local_path)
+        assert len(file_tree) > 0
+
+        # octocat/Hello-World is intentionally minimal (a single extensionless
+        # README) so its language map can legitimately come back empty --
+        # tests/test_language_detector.py covers the non-empty case with a
+        # richer fixture tree; this just proves the real pipeline runs clean.
+        languages = detect_languages(file_tree, live_provider.get_languages(OWNER, REPO))
+        assert isinstance(languages, dict)
+    finally:
+        shutil.rmtree(target_dir, ignore_errors=True)
+
+
+@pytest.mark.network
+def test_assemble_repository_context_end_to_end_against_real_repository(live_provider, live_settings):
+    branch = resolve_branch(live_provider, OWNER, REPO, None)
+    metadata = live_provider.fetch_metadata(OWNER, REPO)
+    commits = live_provider.get_commit_history(OWNER, REPO, branch.name, limit=5)
+    target_dir = build_clone_target_dir(live_settings, OWNER, REPO)
+
+    try:
+        clone_result = live_provider.clone(OWNER, REPO, branch.name, target_dir)
+
+        context = RepositoryContext(
+            repository_id=metadata.repository_id,
+            provider="github",
+            source_url=f"https://github.com/{OWNER}/{REPO}",
+            owner=OWNER,
+            repository_name=REPO,
+        )
+        context.transition_to(IngestionStatus.VALIDATING)
+        context.transition_to(IngestionStatus.FETCHING_METADATA)
+        context.metadata = metadata
+        context.transition_to(IngestionStatus.FETCHING_BRANCHES)
+        context.selected_branch = branch.name
+        context.default_branch = metadata.default_branch
+        context.git_history = commits
+        context.transition_to(IngestionStatus.CLONING)
+        context.local_path = clone_result.local_path
+        context.commit_sha = clone_result.commit_sha
+
+        assemble_repository_context(context, provider=live_provider, evolution_commit_limit=5)
+
+        assert context.analysis_status == IngestionStatus.READY
+        assert context.file_tree
+        assert context.evolution_signals is not None
+        assert context.evolution_signals.analyzed_commit_count == len(commits)
+
+        profile = build_repository_profile(context)
+        assert profile["status"] == "READY"
+        assert profile["file_inventory"]["total_files"] > 0
     finally:
         shutil.rmtree(target_dir, ignore_errors=True)

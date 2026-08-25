@@ -37,6 +37,20 @@ class BranchInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class FileChange:
+    """A single file's change within one commit. GitHub's commit-list
+    endpoint doesn't include this -- it's only available per-commit (see
+    RepositoryProvider.get_commit_file_changes), so it's populated
+    separately from the rest of CommitInfo, for a bounded subset of
+    commits (see app/services/repository_service.py::enrich_commit_history)."""
+
+    path: str
+    additions: int = 0
+    deletions: int = 0
+    status: str = "modified"  # "added" | "modified" | "removed" | "renamed"
+
+
+@dataclass(frozen=True, slots=True)
 class CommitInfo:
     sha: str
     parents: list[str]
@@ -46,7 +60,7 @@ class CommitInfo:
     message: str
     additions: int | None = None
     deletions: int | None = None
-    changed_files: list[str] = field(default_factory=list)
+    changed_files: list[FileChange] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)

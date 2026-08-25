@@ -145,6 +145,68 @@ def test_get_commit_history_bounded_by_configured_max(settings):
 
 
 @respx.mock
+def test_get_commit_history_maps_stats_and_files_when_present(settings):
+    respx.get("https://api.github.com/repos/octocat/hello-world/commits").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "sha": "abc123",
+                    "parents": [],
+                    "commit": {"message": "Fix bug", "author": {}},
+                    "stats": {"additions": 5, "deletions": 2},
+                    "files": [
+                        {"filename": "app/main.py", "additions": 5, "deletions": 2, "status": "modified"}
+                    ],
+                }
+            ],
+        )
+    )
+    with make_provider(settings) as provider:
+        commits = provider.get_commit_history("octocat", "hello-world", "main", limit=10)
+
+    commit = commits[0]
+    assert commit.additions == 5
+    assert commit.deletions == 2
+    assert len(commit.changed_files) == 1
+    assert commit.changed_files[0].path == "app/main.py"
+    assert commit.changed_files[0].status == "modified"
+
+
+@respx.mock
+def test_get_commit_file_changes_parses_files(settings):
+    respx.get("https://api.github.com/repos/octocat/hello-world/commits/abc123").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "sha": "abc123",
+                "files": [
+                    {"filename": "README.md", "additions": 3, "deletions": 1, "status": "modified"},
+                    {"filename": "app/new_file.py", "additions": 10, "deletions": 0, "status": "added"},
+                ],
+            },
+        )
+    )
+    with make_provider(settings) as provider:
+        changes = provider.get_commit_file_changes("octocat", "hello-world", "abc123")
+
+    assert len(changes) == 2
+    assert changes[0].path == "README.md"
+    assert changes[0].additions == 3
+    assert changes[1].status == "added"
+
+
+@respx.mock
+def test_get_commit_file_changes_handles_missing_files_key(settings):
+    respx.get("https://api.github.com/repos/octocat/hello-world/commits/abc123").mock(
+        return_value=httpx.Response(200, json={"sha": "abc123"})
+    )
+    with make_provider(settings) as provider:
+        changes = provider.get_commit_file_changes("octocat", "hello-world", "abc123")
+    assert changes == []
+
+
+@respx.mock
 def test_get_languages_returns_dict(settings):
     respx.get("https://api.github.com/repos/octocat/hello-world/languages").mock(
         return_value=httpx.Response(200, json={"Python": 12345, "HTML": 678})

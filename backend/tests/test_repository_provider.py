@@ -1,4 +1,4 @@
-from app.domain.models import BranchInfo, CloneResult, CommitInfo, RepositoryMetadata
+from app.domain.models import BranchInfo, CloneResult, CommitInfo, FileChange, RepositoryMetadata
 from app.domain.repository_provider import (
     RepositoryProvider,
     get_provider_class_for_host,
@@ -32,6 +32,9 @@ class FakeProvider(RepositoryProvider):
 
     def get_languages(self, owner: str, repo: str) -> dict[str, int]:
         return {"Python": 100}
+
+    def get_commit_file_changes(self, owner: str, repo: str, sha: str) -> list[FileChange]:
+        return []
 
     def clone(self, owner: str, repo: str, branch: str, target_dir: str) -> CloneResult:
         from datetime import datetime, timezone

@@ -18,7 +18,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from app.core.config import Settings, get_settings
-from app.domain.models import BranchInfo, CloneResult, CommitInfo, RepositoryMetadata
+from app.domain.models import BranchInfo, CloneResult, CommitInfo, FileChange, RepositoryMetadata
 from app.domain.repository_provider import RepositoryProvider, register_provider
 from app.services.clone_service import clone_repository
 from app.services.github_client import GitHubApiClient
@@ -68,6 +68,7 @@ def _to_commit_info(payload: dict) -> CommitInfo:
     commit = payload.get("commit") or {}
     author = commit.get("author") or {}
     parents = [p.get("sha", "") for p in (payload.get("parents") or [])]
+    stats = payload.get("stats") or {}
     return CommitInfo(
         sha=payload.get("sha", ""),
         parents=parents,
@@ -75,6 +76,18 @@ def _to_commit_info(payload: dict) -> CommitInfo:
         author_email=author.get("email"),
         committed_at=_parse_github_datetime(author.get("date")),
         message=commit.get("message", ""),
+        additions=stats.get("additions"),
+        deletions=stats.get("deletions"),
+        changed_files=[_to_file_change(f) for f in (payload.get("files") or [])],
+    )
+
+
+def _to_file_change(payload: dict) -> FileChange:
+    return FileChange(
+        path=payload.get("filename", ""),
+        additions=payload.get("additions", 0) or 0,
+        deletions=payload.get("deletions", 0) or 0,
+        status=payload.get("status", "modified"),
     )
 
 
@@ -119,6 +132,10 @@ class GitHubProvider(RepositoryProvider):
     def get_languages(self, owner: str, repo: str) -> dict[str, int]:
         payload = self._client.get_json(f"/repos/{owner}/{repo}/languages")
         return dict(payload) if isinstance(payload, dict) else {}
+
+    def get_commit_file_changes(self, owner: str, repo: str, sha: str) -> list[FileChange]:
+        payload = self._client.get_json(f"/repos/{owner}/{repo}/commits/{sha}")
+        return [_to_file_change(f) for f in (payload.get("files") or [])]
 
     def clone(self, owner: str, repo: str, branch: str, target_dir: str) -> CloneResult:
         token = (

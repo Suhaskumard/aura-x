@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import app.models  # noqa: F401  (registers ORM models on Base.metadata)
 from app.db.base import Base
+from app.db.session import get_db
 from app.main import app
 
 
@@ -30,6 +31,23 @@ def db_session(tmp_path) -> Session:
     finally:
         session.close()
         engine.dispose()
+
+
+@pytest.fixture
+def api_client(db_session) -> TestClient:
+    """TestClient for the real FastAPI app, with app.db.session.get_db
+    overridden to the per-test SQLite db_session -- so /api/v1 route tests
+    never touch the real (possibly unconfigured/unreachable) database
+    Settings.database_url points at."""
+
+    def _override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db, None)
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

@@ -31,6 +31,13 @@ class Settings(BaseSettings):
         default="postgresql+psycopg://aurax:aurax@localhost:5432/aurax",
     )
 
+    # API authentication (Phase 10). Optional, opt-in, same SecretStr
+    # pattern as github_token below -- when unset (the default), API auth
+    # is not enforced (matches this project's local-dev-friendly stance);
+    # set it to require `Authorization: Bearer <token>` on mutating
+    # /api/v1/repositories routes.
+    api_auth_token: SecretStr | None = Field(default=None)
+
     # GitHub integration (backend-only secret; never returned to clients)
     github_token: SecretStr | None = Field(default=None)
     github_api_base_url: str = Field(default="https://api.github.com")
@@ -45,6 +52,9 @@ class Settings(BaseSettings):
 
     def has_github_token(self) -> bool:
         return self.github_token is not None and bool(self.github_token.get_secret_value())
+
+    def has_api_auth_token(self) -> bool:
+        return self.api_auth_token is not None and bool(self.api_auth_token.get_secret_value())
 
 
 @lru_cache

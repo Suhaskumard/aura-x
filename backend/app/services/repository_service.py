@@ -26,19 +26,15 @@ from app.services.language_detector import detect_languages
 from app.services.test_framework_detector import detect_test_directories, detect_test_frameworks
 
 
-def resolve_branch(
-    provider: RepositoryProvider, owner: str, repo: str, requested_branch: str | None
-) -> BranchInfo:
-    """Resolve the branch to analyze.
+def select_branch(branches: list[BranchInfo], requested_branch: str | None) -> BranchInfo:
+    """Pick the branch to analyze from an already-fetched branch list.
 
-    If `requested_branch` is None, the repository's actual default branch
-    is used. If a branch name is given, it must exist on the repository or
+    If `requested_branch` is None, the branch marked `is_default=True` is
+    used. If a branch name is given, it must be present in `branches` or
     BranchNotFoundError is raised -- callers must never silently fall back
-    to a different branch than the one the user asked for.
+    to a different branch than the one asked for. Pure/no I/O -- see
+    resolve_branch() for the network-fetching wrapper around this.
     """
-    branches = provider.list_branches(owner, repo)
-    by_name = {branch.name: branch for branch in branches}
-
     if requested_branch is None:
         for branch in branches:
             if branch.is_default:
@@ -46,16 +42,29 @@ def resolve_branch(
         # Defensive fallback: list_branches() should always mark exactly
         # one branch as default (see GitHubProvider), but if a provider
         # implementation ever fails to, don't silently guess.
-        raise BranchNotFoundError(
-            f"Could not determine the default branch for {owner}/{repo}"
-        )
+        raise BranchNotFoundError("Could not determine the default branch")
 
+    by_name = {branch.name: branch for branch in branches}
     branch = by_name.get(requested_branch)
     if branch is None:
-        raise BranchNotFoundError(
-            f"Branch '{requested_branch}' does not exist on {owner}/{repo}"
-        )
+        raise BranchNotFoundError(f"Branch '{requested_branch}' does not exist")
     return branch
+
+
+def resolve_branch(
+    provider: RepositoryProvider, owner: str, repo: str, requested_branch: str | None
+) -> BranchInfo:
+    """Resolve the branch to analyze, fetching the branch list from
+    `provider` first. See select_branch() to reuse an already-fetched
+    branch list without a second network call (e.g. the ingestion
+    orchestrator, which needs the full branch list for RepositoryContext
+    regardless of which one gets selected).
+    """
+    branches = provider.list_branches(owner, repo)
+    try:
+        return select_branch(branches, requested_branch)
+    except BranchNotFoundError as exc:
+        raise BranchNotFoundError(f"{exc.message} for {owner}/{repo}") from None
 
 
 def build_clone_target_dir(settings: Settings, owner: str, repo: str) -> str:

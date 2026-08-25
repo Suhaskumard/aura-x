@@ -1,8 +1,8 @@
 # AURA-X GitHub Integration
 
 Living document. Updated at the end of every phase in
-`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 9
-(database persistence).
+`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 10
+(REST API layer).
 
 ## Architecture
 
@@ -264,10 +264,11 @@ network clone against `github.com/octocat/Hello-World` is added to
 (HTTPS URL construction, token pass-through) against a mocked
 `clone_repository`, without touching git or the network.
 
-Not yet wired into an API route or an automated ingestion orchestrator —
-that starts at Phase 10/11, which will call `provider.clone(...)` after
-branch resolution and drive `RepositoryContext.transition_to(CLONING)` /
-`local_path` / `commit_sha` from the returned `CloneResult`.
+Wired into the ingestion pipeline in Phase 10 --
+`app/services/ingestion_orchestrator.py::ingest_github_repository` calls
+`provider.clone(...)` after branch selection and drives
+`RepositoryContext.transition_to(CLONING)` / `local_path` / `commit_sha`
+from the returned `CloneResult`, exactly as anticipated here.
 
 ## Constructing RepositoryContext (Phase 8 — implemented)
 
@@ -338,9 +339,10 @@ Orchestration lives in `app/services/repository_service.py`:
   inventory summary (count/size/by-category), and a git history summary.
   Never includes `local_path` (filesystem path) or a secret.
 
-Not yet wired into an API route — that starts at Phase 10/11, which will
-call `assemble_repository_context` after `provider.clone(...)` and expose
-`build_repository_profile` via `/repositories/{id}`.
+Wired into the ingestion pipeline in Phase 10 -- `ingest_github_repository`
+calls `assemble_repository_context` after `provider.clone(...)`, and
+`build_repository_profile`'s output is exposed via
+`GET /api/v1/repositories/{id}/profile`.
 
 Tested in `tests/test_file_scanner.py`, `tests/test_language_detector.py`,
 `tests/test_test_framework_detector.py`, `tests/test_evolution_analysis.py`,
@@ -427,9 +429,12 @@ valid transition) without claiming which stage it reached first.
 `build_config_snapshot(settings, evolution_commit_limit=...)` builds the
 non-secret config snapshot.
 
-Not yet called from an API route or background worker — that starts at
-Phase 10/11, which will call `assemble_repository_context` (Phase 8) then
-`persist_repository_context` (this module) in sequence per ingestion.
+Called from an API route as of Phase 10 --
+`app/services/ingestion_orchestrator.py::ingest_github_repository` calls
+`assemble_repository_context` (Phase 8) then `persist_repository_context`
+(this module) in sequence, synchronously within
+`POST /api/v1/repositories/github`; Phase 11 moves this to a background
+job without changing the sequence itself.
 
 ### Migrations
 
@@ -469,6 +474,101 @@ fresh, file-backed SQLite database per test, created from
 fast and dependency-free); the Alembic migration itself is verified
 separately (see above), not by the pytest suite.
 
+## REST API Layer (Phase 10 — implemented)
+
+`app/api/v1/routes/repositories.py`, mounted under `/api/v1/repositories`
+via `app/api/v1/router.py`. Route handlers are thin: parse/validate the
+request, call a service (`app/services/ingestion_orchestrator.py` or the
+Phase 9 DAO), shape the response — no business logic lives in the route
+layer itself.
+
+### Endpoints
+
+| Method & path | Purpose |
+|---|---|
+| `POST /api/v1/repositories/github` | Ingest a repository: `{repository_url, branch?}` -> runs the full pipeline (Phase 4-9) synchronously and returns the result. |
+| `GET /api/v1/repositories` | Paginated list (`page`, `page_size` query params), newest-updated first. |
+| `GET /api/v1/repositories/{id}` | Repository detail + its latest `AnalysisRun` summary. |
+| `GET /api/v1/repositories/{id}/branches` | The repository's currently known branches (default branch first). |
+| `GET /api/v1/repositories/{id}/profile` | The Repository Profile view (Phase 8's `build_repository_profile()`) from the latest **READY** analysis run. |
+| `GET /api/v1/repositories/{id}/commits` | Paginated commit history, newest first. |
+| `POST /api/v1/repositories/{id}/refresh` | Re-run ingestion for an already-known repository (optionally with a different `branch`); adds a new `AnalysisRun`, doesn't duplicate the `Repository` row. |
+
+All five endpoints are registered and appear in the generated OpenAPI
+schema (`/docs`, `/openapi.json`) with request/response models and
+per-status-code descriptions (see `responses=` on each route).
+
+### Ingestion orchestration
+
+`app/services/ingestion_orchestrator.py::ingest_github_repository(db,
+settings, repository_url, branch)` is what `POST .../github` calls: it
+chains everything built in Phases 4-9 --
+`parse_github_url` -> resolve provider -> `fetch_metadata` ->
+`list_branches` + `select_branch` -> `get_commit_history` +
+`get_languages` -> `clone` -> `assemble_repository_context` (Phase 8) ->
+`persist_repository_context` (Phase 9) — synchronously, in the request.
+`refresh_repository_ingestion(db, settings, repository_id, branch)` looks
+up the repository's stored `source_url` and calls the same function, so
+"refresh" is just "ingest again."
+
+A malformed/unsupported URL raises before anything is constructed or
+persisted (`parse_github_url` runs first). Once the URL is valid, every
+further failure (repo not found, branch not found, rate limited, clone
+failed, ...) is caught, attached to the `RepositoryContext` via
+`context.fail(...)`, and **still persisted** as a `FAILED` `AnalysisRun` —
+so `POST .../github` normally returns `201` either way, with `status`
+in the body telling you which (`READY` or `FAILED`, plus `error_code`/
+`error_message` when failed). This mirrors how Phase 11's asynchronous
+version will behave (a job is accepted; you poll `status`), so Phase 11
+only needs to change *when* the response is available, not its shape.
+
+`select_branch(branches, requested_branch)` (a new pure function
+extracted from Phase 6's `resolve_branch`, which still fetches its own
+branch list and delegates to it) lets the orchestrator reuse the branch
+list it already needs for `RepositoryContext.branches` instead of an
+extra network call.
+
+### Structured errors
+
+`app/api/v1/error_handlers.py` registers one FastAPI exception handler
+for `RepositoryIntegrationError` (the common base every domain error in
+`app/domain/errors.py` extends) that renders `exc.to_dict()`
+(`{"code", "message"}`) with a status code looked up from a fixed
+code -> status table — no raw exception, stack trace, or GitHub payload
+ever reaches an HTTP response. Two error codes are new in Phase 10:
+
+| Code | HTTP status | Raised by |
+|---|---|---|
+| `ANALYSIS_NOT_READY` | 409 | `GET .../profile` when the latest run isn't `READY` yet (or none exists) |
+| `UNAUTHORIZED` | 401 | `require_api_auth` when `api_auth_token` is configured and the request's bearer token doesn't match |
+
+### API authentication
+
+Optional and opt-in, via `Settings.api_auth_token` (`SecretStr`, same
+pattern as `github_token`) — unset (default) means no auth is enforced,
+matching this project's local-dev-friendly stance from Phase 0/1; there
+was no pre-existing user-auth convention in the codebase to extend, so
+this introduces the minimal one. When set, `POST .../github` and
+`POST .../{id}/refresh` (the two mutating/write endpoints) require
+`Authorization: Bearer <api_auth_token>`; the five read-only `GET`
+endpoints are never gated, configured or not.
+
+### Testing
+
+`backend/tests/test_api_repositories.py` — real HTTP calls through
+`TestClient` against the actual FastAPI app (`app.db.session.get_db`
+overridden to a per-test SQLite database via the `api_client` fixture in
+`tests/conftest.py`; nothing else is mocked or bypassed), with `respx`
+faking the GitHub HTTP boundary and `app.services.github_provider.
+clone_repository` monkeypatched to a real local fixture tree (same
+patterns Phases 5-7's own tests already use) — so these exercise the
+real route -> orchestrator -> Phase 8 -> Phase 9 pipeline end-to-end.
+Covers: valid public repo ingestion (through to profile/branches/commits
+retrieval), invalid URL, unsupported host, branch selection, unknown
+branch (failed run persisted + surfaced via 409 on `/profile`), unknown
+repository (404), refresh (same repository, new analysis run),
+pagination, and auth required/not-required.
+
 ## Authentication
 
 `GITHUB_TOKEN` (optional, backend-only, `SecretStr`) — see
@@ -498,7 +598,7 @@ Structured error codes and where each is currently raised:
 |---|---|
 | `INVALID_REPOSITORY_URL` | `app/domain/github_url.py` (Phase 4) |
 | `UNSUPPORTED_REPOSITORY_PROVIDER` | `app/domain/github_url.py` (Phase 4) |
-| `REPOSITORY_NOT_FOUND` | reserved; not yet raised (Phase 10/11 route wiring) |
+| `REPOSITORY_NOT_FOUND` | `app/api/v1/routes/repositories.py` (unknown `{repository_id}`), `app/services/ingestion_orchestrator.py::refresh_repository_ingestion` (Phase 10) |
 | `REPOSITORY_ACCESS_DENIED` | `app/services/github_client.py` (Phase 5) |
 | `BRANCH_NOT_FOUND` | `app/services/repository_service.py::resolve_branch` (Phase 6) |
 | `RATE_LIMITED` | `app/services/github_client.py` (Phase 5) |
@@ -509,6 +609,11 @@ Structured error codes and where each is currently raised:
 | `REPOSITORY_TOO_LARGE` | `app/services/clone_service.py` (Phase 7) |
 | `REPOSITORY_SCAN_FAILED` | `app/services/repository_service.py::assemble_repository_context` (Phase 8) |
 | `INVALID_STATE_TRANSITION` | `app/domain/repository_context.py` (Phase 3) |
+| `ANALYSIS_NOT_READY` | `app/api/v1/routes/repositories.py` (`GET .../profile` with no `READY` run yet) (Phase 10) |
+| `UNAUTHORIZED` | `app/api/v1/routes/repositories.py::require_api_auth` (Phase 10) |
+
+Every code above maps to an HTTP status via a single table in
+`app/api/v1/error_handlers.py` (Phase 10) -- see "REST API Layer" above.
 
 ## Testing
 
@@ -531,13 +636,22 @@ Structured error codes and where each is currently raised:
 
 - Only `GitHubProvider` is implemented; `LocalRepositoryProvider` and
   `GitLabProvider` are named in the abstraction but not implemented.
-- No API route or ingestion orchestrator calls `resolve_branch`/`clone`/
-  `assemble_repository_context`/`persist_repository_context` yet — that
-  starts at Phase 10/11.
+- Ingestion (`POST /api/v1/repositories/github` and `.../refresh`) runs
+  synchronously inside the HTTP request -- for a large repository this
+  means a slow response, not a queued job with live progress. That's
+  Phase 11's job ("Asynchronous Status Tracking"); Phase 10's response
+  shape (`status` + `error_code`/`error_message` in the body) is designed
+  not to need to change when that lands, only *when* the response arrives.
 - The initial migration was verified against SQLite only (no Postgres
   instance available in this environment); it uses no Postgres-specific
   types, but running it against a real Postgres instance is still
   recommended before Phase 9's persistence is relied on in production.
+- API auth (`api_auth_token`) is a single shared bearer token, not a
+  per-user/per-team identity system -- adequate for a single-backend
+  deployment, not for multi-tenant use.
+- No rate limiting or request throttling on `/api/v1/repositories` routes
+  -- a client could exhaust the configured GitHub token's rate limit by
+  issuing many ingestion requests.
 - `clone()` always performs a shallow (`--depth 1`), single-branch clone;
   full history is never fetched to disk (commit history for analysis
   comes from the GitHub API, bounded by `max_commit_history`, not from the

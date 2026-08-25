@@ -77,5 +77,13 @@ class RepositoryScanFailedError(RepositoryIntegrationError):
     code = "REPOSITORY_SCAN_FAILED"
 
 
+class AnalysisNotReadyError(RepositoryIntegrationError):
+    code = "ANALYSIS_NOT_READY"
+
+
+class UnauthorizedError(RepositoryIntegrationError):
+    code = "UNAUTHORIZED"
+
+
 class InvalidStateTransitionError(RepositoryIntegrationError):
     code = "INVALID_STATE_TRANSITION"

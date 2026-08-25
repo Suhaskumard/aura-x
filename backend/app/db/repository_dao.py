@@ -19,7 +19,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.domain.errors import InvalidStateTransitionError
@@ -233,3 +233,42 @@ def fail_analysis_run(db: Session, run: AnalysisRun, error: dict) -> AnalysisRun
     run.error_message = error.get("message")
     db.flush()
     return run
+
+
+def get_latest_analysis_run(db: Session, repository_id: str) -> AnalysisRun | None:
+    stmt = (
+        select(AnalysisRun)
+        .where(AnalysisRun.repository_id == repository_id)
+        .order_by(AnalysisRun.started_at.desc())
+        .limit(1)
+    )
+    return db.execute(stmt).scalar_one_or_none()
+
+
+# ---- Pagination (Phase 10: REST API layer) ----
+
+
+def list_repositories(db: Session, *, offset: int, limit: int) -> list[Repository]:
+    stmt = select(Repository).order_by(Repository.updated_at.desc()).offset(offset).limit(limit)
+    return list(db.execute(stmt).scalars().all())
+
+
+def count_repositories(db: Session) -> int:
+    return db.execute(select(func.count()).select_from(Repository)).scalar_one()
+
+
+def list_commits(db: Session, repository_id: str, *, offset: int, limit: int) -> list[Commit]:
+    stmt = (
+        select(Commit)
+        .where(Commit.repository_id == repository_id)
+        .order_by(Commit.committed_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(db.execute(stmt).scalars().all())
+
+
+def count_commits(db: Session, repository_id: str) -> int:
+    return db.execute(
+        select(func.count()).select_from(Commit).where(Commit.repository_id == repository_id)
+    ).scalar_one()

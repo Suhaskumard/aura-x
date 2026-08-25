@@ -1,16 +1,14 @@
 """
 Top-level /api/v1 router.
-
-Route modules for repository ingestion (POST/GET /repositories, ...) are
-added starting Phase 10. Phase 0 only registers a health check so the
-service is provably running end-to-end.
 """
 
 from fastapi import APIRouter
 
+from app.api.v1.routes.repositories import router as repositories_router
 from app.core.config import get_settings
 
 api_router = APIRouter()
+api_router.include_router(repositories_router)
 
 
 @api_router.get("/health", tags=["system"])

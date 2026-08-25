@@ -1,8 +1,8 @@
 # AURA-X GitHub Integration
 
 Living document. Updated at the end of every phase in
-`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 13
-(dashboard integration).
+`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 14
+(Excel reporting integration).
 
 ## Architecture
 
@@ -830,6 +830,82 @@ real 6-branch dropdown for re-analysis). This confirms the exit
 criteria — a user can complete the full onboarding flow using only real
 API data — end-to-end, not just via code review.
 
+## Excel Reporting Integration (Phase 14 — implemented)
+
+`app/reporting/excel_export.py`. The plan frames this phase as routing
+facts into "the existing Excel export pipeline" — there wasn't one in
+this codebase (confirmed: no `openpyxl`/`xlsxwriter` anywhere before this
+phase, and the Phase 1 audit already flagged "no Excel reporting of any
+kind"), so this phase builds it, the same way Phase 12 built the
+downstream analysis modules it was asked to "connect."
+
+### What it does
+
+`build_repository_workbook(db, repository_id, analysis_run_id)` returns
+an in-memory `openpyxl.Workbook`; `save_repository_workbook(..., path)`
+builds and writes it to an `.xlsx` file. Two sheets:
+
+- **`Repository`** — a Field/Value identity block: Repository URL,
+  Provider, Owner, Repository Name, Selected Branch, Commit SHA, Primary
+  Language, Analysis Timestamp, Status, Description, Visibility,
+  Stargazers, Forks, Total Files, Total Size, Commits Analyzed, Analysis
+  Run ID — exactly the fields the plan lists, plus a few more identity/
+  statistics fields already available on the same two rows.
+- **`Languages`** — the language distribution (byte count + percentage
+  per language), sorted by size, descending.
+
+### Not a separate data path
+
+Every field is read through `app.db.repository_dao` — the exact same
+`get_repository_by_id`/`get_analysis_run` functions the REST API layer
+(Phase 10) uses — against the exact same `Repository`/`AnalysisRun` ORM
+rows (Phase 9). `_identity_rows()` in `excel_export.py` is a closed,
+explicit list of exactly what's written; nothing reads
+`RepositoryContext`, re-fetches from GitHub, or touches
+`app.core.config.Settings` (where `GITHUB_TOKEN` lives) at all — so there
+is structurally nowhere for a credential to enter the workbook, not just
+an omission that happens to hold today.
+
+Requires the target `AnalysisRun.status == READY` (raises
+`AnalysisNotReadyError` otherwise — there's no `result_profile`
+[languages, file inventory] to report before then) and that the run
+actually belongs to the given repository (`RepositoryNotFoundError`
+otherwise) — the same two structured errors Phase 10's API already uses,
+reused here rather than inventing new ones.
+
+### Testing
+
+`backend/tests/test_excel_export.py` — builds a real `READY`
+`AnalysisRun` through the Phase 9 DAO (walking the real transition
+sequence, not a shortcut), then:
+
+- asserts every expected field/value is present on both sheets (the
+  "snapshot test asserting expected fields present" this phase's plan
+  asks for), and
+- the credential-leakage check the plan explicitly asks for: configures
+  `Settings(github_token=<fake token value>)` alongside the test data,
+  generates the workbook, and scans **every cell of every sheet** to
+  assert that value never appears anywhere, plus asserts no column
+  header or field name contains `token`/`secret`/`password`/
+  `authorization`/`bearer` (same pattern as
+  `tests/test_repository_context.py::test_context_never_carries_a_secret_field`
+  from Phase 3).
+- Also covers: unknown repository/run, a run belonging to a different
+  repository, a non-`READY` run, and that `save_repository_workbook`
+  produces a real file `openpyxl` can load back.
+
+### Not yet done
+
+Per the deliverable list ("Updated Excel export" -- the module itself),
+no API route exposes this yet (e.g. a
+`GET /repositories/{id}/analysis-runs/{run_id}/export.xlsx` download) and
+the dashboard has no "Export" button. Same scope discipline as Phase
+12's downstream analysis modules: the capability is built and fully
+tested at the service layer; wiring it to a user-facing trigger is left
+for later, since neither the deliverable list nor the remaining phases
+(15 test suite, 16 end-to-end validation) allocate that to a specific
+phase.
+
 ## Authentication
 
 `GITHUB_TOKEN` (optional, backend-only, `SecretStr`) — see
@@ -936,6 +1012,14 @@ Every code above maps to an HTTP status via a single table in
   paginated server-side, but the dashboard always requests the first 50
   and doesn't expose page controls) -- fine at today's scale, revisit if
   the list grows past that.
+- Excel export (`app/reporting/excel_export.py`, Phase 14) has no API
+  route or dashboard "Export" button yet -- callable today only from
+  Python (a script, a REPL, or a future route/CLI). Only the identity
+  block and language distribution are exported; downstream analysis
+  results (Phase 12: Repository Intelligence, Evolution, Risk, Test
+  Planning) aren't in the workbook -- not asked for by this phase's task
+  list, and those modules aren't persisted yet either (see Phase 12's
+  "Not yet done").
 - `clone()` always performs a shallow (`--depth 1`), single-branch clone;
   full history is never fetched to disk (commit history for analysis
   comes from the GitHub API, bounded by `max_commit_history`, not from the

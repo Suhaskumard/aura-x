@@ -1,9 +1,8 @@
 # AURA-X GitHub Integration
 
 Living document. Updated at the end of every phase in
-`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 12
-(connecting Repository Intelligence, Evolution Analysis, Dependency
-Analysis, Risk Assessment, and Test Planning).
+`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 13
+(dashboard integration).
 
 ## Architecture
 
@@ -763,6 +762,74 @@ walkthrough explicitly ends with "hand off to downstream analysis" as
 the last step, matching this phase's scope of exposing the entry points
 without yet wiring them to run automatically.
 
+## Dashboard Integration (Phase 13 — implemented)
+
+`frontend/` — a single-page onboarding dashboard wired entirely to the
+real `/api/v1/repositories` endpoints (Phase 10-11). No hardcoded
+repository cards, no simulated progress: every value rendered comes from
+an actual HTTP response.
+
+### Flow
+
+The API has no "preview repository info before starting analysis"
+endpoint (`POST .../github` both looks up and starts ingestion in one
+call), so branch selection happens after the fact rather than before, as
+a re-analysis action once real branch data exists:
+
+1. **Repository list** (`RepositoryList.tsx`) — `GET /api/v1/repositories`,
+   rendered as real cards (owner/name, description, primary language,
+   stars, forks, live `latest_status`). Empty state when nothing's been
+   analyzed yet, not a fake placeholder card.
+2. **Onboarding form** (`OnboardingForm.tsx`) — paste a URL (+ optional
+   branch), `POST /api/v1/repositories/github`. Structured validation
+   errors (`ApiError.code`/`message` from the backend's `{code, message}`
+   body) are shown inline, not swallowed.
+3. **Live progress** (`IngestionProgress.tsx` + `usePolling.ts`) — polls
+   `GET /api/v1/repositories/{id}/analysis-runs/{run_id}` every 1.5s. The
+   stage list (`Queued → Validating → Fetching → Cloning → Analyzing →
+   Ready`) highlights the current stage from the polled response only —
+   there is no timer, animation, or client-side simulation of progress.
+   `usePolling` stops once `status` is `READY` or `FAILED`.
+4. **Repository Profile** (`RepositoryProfileView.tsx`) — once `READY`,
+   fetches `GET .../profile` and `GET .../branches` and renders exactly
+   what the plan asks for: name, owner, description, selected branch,
+   commit SHA, languages (as percentage bars from the profile's
+   `languages` byte counts), file/size/commit statistics, detected test
+   frameworks, dependencies, and status. Also offers "Re-analyze this
+   branch" — a real `<select>` populated from `GET .../branches`, calling
+   `POST .../refresh` with the chosen branch, which is genuine branch
+   selection backed by real data (see the note on the two-step flow
+   above).
+5. **Failure view** — the structured `error_code`/`error_message` from a
+   `FAILED` run, plus a "Retry analysis" button (`POST .../refresh`).
+
+### API client
+
+`frontend/src/api.ts` — typed request functions and response interfaces
+mirroring `backend/app/api/v1/schemas.py` field-for-field (including the
+public status vocabulary from Phase 11: `QUEUED | VALIDATING | FETCHING
+| CLONING | ANALYZING | READY | FAILED`). A non-2xx response is parsed
+into `ApiError { code, message, status }` from the backend's structured
+error body, so validation/not-found/rate-limit/etc. errors surface with
+their real code and message rather than a generic "request failed."
+
+### Verification
+
+No frontend test framework is configured in this project (`Phase 15`
+covers the test suite); this phase's own test requirement is a manual/
+E2E browser walkthrough, which was performed for real: `npm run build`
+(TypeScript + Vite build, clean), the backend run against a temporary
+SQLite database (`alembic upgrade head`), and the dashboard driven in a
+real browser against `https://github.com/psf/requests` end-to-end —
+including hitting GitHub's real unauthenticated rate limit mid-run
+(surfaced correctly as `RATE_LIMITED` with the reset time, via the
+failure view's Retry flow) and, after the limit reset, a full run through
+to a populated profile (125 files, 3.6MB, 200 commits analyzed, an
+8-language breakdown, `pytest`/`tox` detected, 6 dependencies, and a
+real 6-branch dropdown for re-analysis). This confirms the exit
+criteria — a user can complete the full onboarding flow using only real
+API data — end-to-end, not just via code review.
+
 ## Authentication
 
 `GITHUB_TOKEN` (optional, backend-only, `SecretStr`) — see
@@ -852,7 +919,23 @@ Every code above maps to an HTTP status via a single table in
   deployment, not for multi-tenant use.
 - No rate limiting or request throttling on `/api/v1/repositories` routes
   -- a client could exhaust the configured GitHub token's rate limit by
-  issuing many ingestion requests.
+  issuing many ingestion requests. Confirmed directly during Phase 13's
+  browser walkthrough: without `GITHUB_TOKEN` configured, GitHub's
+  unauthenticated limit (60 requests/hour) is easy to exhaust across a
+  handful of ingestions -- set `GITHUB_TOKEN` for real usage (raises it
+  to 5000/hour).
+- The dashboard (`frontend/`) has no automated tests -- no test framework
+  is configured in this project yet (`vitest`/`@testing-library` are not
+  installed); Phase 13's own test requirement is a manual/E2E browser
+  walkthrough, which was performed, not an automated suite. Automated
+  frontend tests are Phase 15's scope ("Comprehensive Test Suite").
+- The dashboard doesn't send `Authorization` headers, so it only works
+  against a backend with `api_auth_token` unset (the default). If that's
+  configured, the dashboard has no UI to supply the token.
+- No pagination UI on the repository list yet (`GET /repositories` is
+  paginated server-side, but the dashboard always requests the first 50
+  and doesn't expose page controls) -- fine at today's scale, revisit if
+  the list grows past that.
 - `clone()` always performs a shallow (`--depth 1`), single-branch clone;
   full history is never fetched to disk (commit history for analysis
   comes from the GitHub API, bounded by `max_commit_history`, not from the

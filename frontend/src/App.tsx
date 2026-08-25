@@ -1,51 +1,147 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import './App.css'
+import { ApiError, getRepository, refreshRepository } from './api'
+import IngestionProgress from './components/IngestionProgress'
+import OnboardingForm from './components/OnboardingForm'
+import RepositoryList from './components/RepositoryList'
+import RepositoryProfileView from './components/RepositoryProfileView'
 
-type HealthResponse = {
-  status: string
-  app_name: string
-  environment: string
-  github_token_configured: boolean
-}
-
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
+type View =
+  | { kind: 'list' }
+  | { kind: 'progress'; repositoryId: string; analysisRunId: string }
+  | { kind: 'profile'; repositoryId: string }
+  | { kind: 'failed'; repositoryId: string; errorCode: string | null; errorMessage: string | null }
 
 function App() {
-  const [health, setHealth] = useState<HealthResponse | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [view, setView] = useState<View>({ kind: 'list' })
+  const [refreshToken, setRefreshToken] = useState(0)
+  const [selectError, setSelectError] = useState<string | null>(null)
 
-  useEffect(() => {
-    fetch(`${API_BASE_URL}/api/v1/health`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`Backend returned ${res.status}`)
-        return res.json() as Promise<HealthResponse>
-      })
-      .then(setHealth)
-      .catch((err: Error) => setError(err.message))
-  }, [])
+  function backToList() {
+    setView({ kind: 'list' })
+    setRefreshToken((token) => token + 1)
+  }
+
+  async function handleSelectRepository(repositoryId: string) {
+    setSelectError(null)
+    try {
+      const detail = await getRepository(repositoryId)
+      const run = detail.latest_analysis_run
+      if (!run || run.status === 'READY') {
+        setView({ kind: 'profile', repositoryId })
+      } else if (run.status === 'FAILED') {
+        setView({
+          kind: 'failed',
+          repositoryId,
+          errorCode: run.error_code,
+          errorMessage: run.error_message,
+        })
+      } else {
+        setView({ kind: 'progress', repositoryId, analysisRunId: run.id })
+      }
+    } catch (err) {
+      setSelectError(err instanceof ApiError ? err.message : 'Could not open this repository.')
+    }
+  }
 
   return (
-    <main style={{ fontFamily: 'sans-serif', padding: '2rem', maxWidth: 640 }}>
-      <h1>AURA-X</h1>
-      <p>Autonomous Unified Reliability &amp; Evolution Analyzer</p>
-      <p>
-        This is the Phase 0 bootstrap shell. The GitHub repository onboarding
-        UI is implemented in Phase 13 of the integration plan.
-      </p>
+    <main className="app">
+      <header className="app-header">
+        <h1>AURA-X</h1>
+        <p className="muted">Autonomous Unified Reliability &amp; Evolution Analyzer</p>
+      </header>
 
-      <h2>Backend connectivity</h2>
-      {error && (
-        <p style={{ color: 'crimson' }}>
-          Could not reach backend at {API_BASE_URL}: {error}
-        </p>
+      {view.kind !== 'list' && (
+        <button type="button" className="link-button" onClick={backToList}>
+          ← Back to repositories
+        </button>
       )}
-      {!error && !health && <p>Checking backend health…</p>}
-      {health && (
-        <pre style={{ background: '#f1f5f9', padding: '1rem', borderRadius: 8 }}>
-          {JSON.stringify(health, null, 2)}
-        </pre>
+
+      {view.kind === 'list' && (
+        <>
+          <section>
+            <h2>Repositories</h2>
+            {selectError && <p className="error-text">{selectError}</p>}
+            <RepositoryList onSelect={handleSelectRepository} refreshToken={refreshToken} />
+          </section>
+          <OnboardingForm
+            onStarted={(repositoryId, analysisRunId) =>
+              setView({ kind: 'progress', repositoryId, analysisRunId })
+            }
+          />
+        </>
+      )}
+
+      {view.kind === 'progress' && (
+        <IngestionProgress
+          repositoryId={view.repositoryId}
+          analysisRunId={view.analysisRunId}
+          onReady={() => setView({ kind: 'profile', repositoryId: view.repositoryId })}
+          onFailed={(errorCode, errorMessage) =>
+            setView({ kind: 'failed', repositoryId: view.repositoryId, errorCode, errorMessage })
+          }
+        />
+      )}
+
+      {view.kind === 'profile' && (
+        <RepositoryProfileView
+          repositoryId={view.repositoryId}
+          onRefreshStarted={(analysisRunId) =>
+            setView({ kind: 'progress', repositoryId: view.repositoryId, analysisRunId })
+          }
+        />
+      )}
+
+      {view.kind === 'failed' && (
+        <FailureView
+          errorCode={view.errorCode}
+          errorMessage={view.errorMessage}
+          onRetry={async () => {
+            const result = await refreshRepository(view.repositoryId)
+            setView({ kind: 'progress', repositoryId: view.repositoryId, analysisRunId: result.analysis_run_id })
+          }}
+        />
       )}
     </main>
+  )
+}
+
+function FailureView({
+  errorCode,
+  errorMessage,
+  onRetry,
+}: {
+  errorCode: string | null
+  errorMessage: string | null
+  onRetry: () => Promise<void>
+}) {
+  const [retrying, setRetrying] = useState(false)
+  const [retryError, setRetryError] = useState<string | null>(null)
+
+  async function handleRetry() {
+    setRetrying(true)
+    setRetryError(null)
+    try {
+      await onRetry()
+    } catch (err) {
+      setRetryError(err instanceof ApiError ? err.message : 'Could not retry analysis.')
+      setRetrying(false)
+    }
+  }
+
+  return (
+    <div className="failure">
+      <h2>Analysis failed</h2>
+      <p className="error-text">
+        {errorCode && <code>{errorCode}</code>}
+        {errorCode && errorMessage ? ' — ' : ''}
+        {errorMessage ?? 'The ingestion run did not complete successfully.'}
+      </p>
+      <button type="button" onClick={handleRetry} disabled={retrying}>
+        {retrying ? 'Retrying…' : 'Retry analysis'}
+      </button>
+      {retryError && <p className="error-text">{retryError}</p>}
+    </div>
   )
 }
 

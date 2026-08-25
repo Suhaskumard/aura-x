@@ -175,13 +175,33 @@ class GitHubApiClient:
             ) from exc
 
     def get_paginated(self, path: str, *, limit: int, params: dict | None = None) -> list[Any]:
-        """Follow GitHub's Link-header pagination, collecting up to `limit` items."""
+        """Follow GitHub's Link-header pagination, collecting up to `limit` items.
+
+        Guards against a malformed or hostile upstream whose Link header
+        never actually converges (e.g. a "next" URL that repeats, with each
+        page returning fewer items than `per_page` -- including zero): a
+        page URL already visited raises MalformedUpstreamResponseError
+        instead of looping forever, and a hard cap on page count backstops
+        any non-repeating-but-endless chain.
+        """
         results: list[Any] = []
         next_url: str | None = path
         next_params: dict | None = dict(params or {})
         next_params.setdefault("per_page", min(100, max(limit, 1)))
+        visited_urls: set[str] = set()
+        max_pages = max(1, -(-limit // 1)) + 20  # generous: at least one page per item, plus slack
 
         while next_url and len(results) < limit:
+            if next_url in visited_urls:
+                raise MalformedUpstreamResponseError(
+                    f"GitHub API pagination did not converge -- repeated page URL {next_url}"
+                )
+            if len(visited_urls) >= max_pages:
+                raise MalformedUpstreamResponseError(
+                    f"GitHub API pagination exceeded {max_pages} pages without reaching the requested limit"
+                )
+            visited_urls.add(next_url)
+
             response = self._request("GET", next_url, params=next_params)
             try:
                 page = response.json()

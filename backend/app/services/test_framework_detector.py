@@ -70,7 +70,11 @@ def _frameworks_from_package_json(root_path: Path) -> set[str]:
         return set()
     if not isinstance(payload, dict):
         return set()
-    deps = {**(payload.get("dependencies") or {}), **(payload.get("devDependencies") or {})}
+    deps: set[str] = set()
+    for key in ("dependencies", "devDependencies"):
+        section = payload.get(key)
+        if isinstance(section, dict):
+            deps.update(section.keys())
     return {framework for name, framework in _NPM_PACKAGE_MARKERS.items() if name in deps}
 
 

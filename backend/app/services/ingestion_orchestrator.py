@@ -24,11 +24,13 @@ for why that's diagnosable rather than a silent hang.
 
 from __future__ import annotations
 
+import logging
 from urllib.parse import urlparse
 from uuid import uuid4
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.analysis.pipeline import run_downstream_analysis
 from app.core.config import Settings
 from app.db.repository_dao import (
     complete_analysis_run,
@@ -50,6 +52,7 @@ from app.domain.github_url import parse_github_url
 from app.domain.repository_context import IngestionStatus, RepositoryContext
 from app.domain.repository_provider import get_provider_class_for_host
 from app.models.analysis_run import AnalysisRun
+from app.services.clone_service import remove_workspace
 from app.services.ingestion_persistence import build_config_snapshot
 from app.services.repository_service import (
     DEFAULT_EVOLUTION_COMMIT_LIMIT,
@@ -58,6 +61,8 @@ from app.services.repository_service import (
     build_repository_profile,
     select_branch,
 )
+
+logger = logging.getLogger(__name__)
 
 # This module lives inside the app.services package, so importing it
 # already runs app/services/__init__.py first, which registers
@@ -120,6 +125,45 @@ def _advance(db: Session, run: AnalysisRun, context: RepositoryContext, status: 
     db.commit()
 
 
+def _hand_off_to_downstream_analysis(context: RepositoryContext) -> None:
+    """Run the Phase 12 downstream analysis stages (Repository
+    Intelligence, Evolution Analysis, Dependency Analysis, Risk
+    Assessment, Test Planning) against the just-completed context -- the
+    "hand off to downstream analysis" step of the full pipeline (Phase
+    16). Not persisted or exposed via the API yet (see
+    docs/GITHUB_INTEGRATION.md "Downstream analysis" for that scope
+    decision); this proves the hand-off itself is real, not skipped, by
+    actually running it and logging a summary. Deliberately never allowed
+    to affect the AnalysisRun's outcome -- ingestion has already
+    succeeded by the time this runs, and a bug in an unrelated downstream
+    module must not turn that into a failure.
+    """
+    try:
+        result = run_downstream_analysis(context)
+    except Exception:  # noqa: BLE001 - analysis failures must never affect ingestion's own outcome
+        logger.exception(
+            "Downstream analysis failed for %s/%s (commit %s) -- ingestion result is unaffected",
+            context.owner,
+            context.repository_name,
+            context.commit_sha,
+        )
+        return
+
+    logger.info(
+        "Downstream analysis complete for %s/%s (commit %s): primary_language=%s size=%s "
+        "churn_pattern=%s high_risk_files=%d test_recommendations=%d dependencies=%d",
+        context.owner,
+        context.repository_name,
+        context.commit_sha,
+        result.intelligence.primary_language,
+        result.intelligence.size_classification,
+        result.evolution.churn_pattern,
+        len(result.risk.high_risk_files),
+        len(result.test_planning.recommendations),
+        result.dependencies.dependency_count,
+    )
+
+
 def run_ingestion_job(run_id: str, *, settings: Settings, session_factory: sessionmaker) -> None:
     """The actual ingestion pipeline for an already-enqueued AnalysisRun.
     Meant to run as a FastAPI BackgroundTask -- opens its own session via
@@ -143,9 +187,11 @@ def run_ingestion_job(run_id: str, *, settings: Settings, session_factory: sessi
         )
         evolution_commit_limit = run.config_snapshot.get("evolution_commit_limit", DEFAULT_EVOLUTION_COMMIT_LIMIT)
 
-        provider_cls = _provider_class_for_source_url(repository.source_url)
-        provider = provider_cls(settings=settings)
+        provider = None
         try:
+            provider_cls = _provider_class_for_source_url(repository.source_url)
+            provider = provider_cls(settings=settings)
+
             _advance(db, run, context, IngestionStatus.VALIDATING)
 
             _advance(db, run, context, IngestionStatus.FETCHING_METADATA)
@@ -193,15 +239,56 @@ def run_ingestion_job(run_id: str, *, settings: Settings, session_factory: sessi
             upsert_commits(db, repository, context.git_history)
             if context.analysis_status == IngestionStatus.READY:
                 complete_analysis_run(db, run, result_profile=build_repository_profile(context))
+                _hand_off_to_downstream_analysis(context)
             else:
                 fail_analysis_run(db, run, context.last_error or {})
             db.commit()
         except RepositoryIntegrationError as exc:
             fail_analysis_run(db, run, exc.to_dict())
             db.commit()
+        except Exception:
+            # A bug, or something outside the RepositoryIntegrationError
+            # taxonomy (e.g. a DB IntegrityError from a unique-constraint
+            # race between two concurrent runs for the same repository),
+            # must still resolve this AnalysisRun to FAILED rather than
+            # propagate out of a BackgroundTask uncaught -- an uncaught
+            # exception here is silently logged by the server with no
+            # caller to observe it, leaving the run stuck at whatever
+            # status it last reached forever (see module docstring).
+            logger.exception(
+                "Unexpected error during ingestion for AnalysisRun %s (repository %s/%s) -- marking FAILED",
+                run.id,
+                context.owner,
+                context.repository_name,
+            )
+            db.rollback()  # the session may hold a failed flush/transaction
+            fail_analysis_run(
+                db, run, {"code": "INTERNAL_ERROR", "message": "An unexpected error occurred during ingestion."}
+            )
+            db.commit()
         finally:
             close = getattr(provider, "close", None)
             if callable(close):
                 close()
+            # The cloned working tree (Phase 7) has no purpose once this
+            # function returns -- everything that reads it from disk
+            # (file scanning, dependency/test-framework detection, the
+            # Phase 16 downstream-analysis hand-off above) already ran
+            # synchronously within this same call, and the persisted
+            # result_profile/downstream reports carry forward everything
+            # derived from it. Leaving it on disk after every single
+            # ingestion/refresh -- success or failure -- is pure,
+            # unbounded workspace_root growth with nothing to reclaim it.
+            if context.local_path:
+                try:
+                    remove_workspace(context.local_path)
+                except OSError:
+                    logger.warning(
+                        "Failed to remove ingestion workspace %s for %s/%s",
+                        context.local_path,
+                        context.owner,
+                        context.repository_name,
+                        exc_info=True,
+                    )
     finally:
         db.close()

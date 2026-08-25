@@ -14,6 +14,8 @@ Poll GET .../{id} or GET .../{id}/analysis-runs/{run_id} for live status.
 
 from __future__ import annotations
 
+import secrets
+
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -67,7 +69,7 @@ def require_api_auth(
     if not settings.has_api_auth_token():
         return
     expected = f"Bearer {settings.api_auth_token.get_secret_value()}"
-    if authorization != expected:
+    if authorization is None or not secrets.compare_digest(authorization, expected):
         raise UnauthorizedError("Missing or invalid Authorization header")
 
 

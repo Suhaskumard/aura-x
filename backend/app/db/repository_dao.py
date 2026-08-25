@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.domain.errors import InvalidStateTransitionError
@@ -65,6 +66,14 @@ def upsert_repository(
     place (fresh metadata, `updated_at` advanced) instead of creating a
     duplicate -- Branch/Commit/AnalysisRun history for it is preserved and
     extended, not reset.
+
+    Two concurrent callers can both observe "no existing row" for the same
+    brand-new identity and both attempt to insert -- the loser hits
+    `uq_repositories_provider_owner_name` (see app/models/repository.py).
+    Rather than let that raw IntegrityError surface as a 500 for what is a
+    legitimate concurrent-request scenario (Phase 8), the loser rolls back
+    its own failed insert and falls back to updating the row the winner
+    just created, exactly as if it had observed it in the first place.
     """
     repository = get_repository_by_identity(db, provider=provider, owner=owner, name=name)
     if repository is None:
@@ -76,6 +85,14 @@ def upsert_repository(
             source_url=source_url,
         )
         db.add(repository)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            repository = get_repository_by_identity(db, provider=provider, owner=owner, name=name)
+            if repository is None:  # pragma: no cover - defensive; not actually a duplicate-insert race
+                raise
+            repository.source_url = source_url
     else:
         repository.source_url = source_url
 

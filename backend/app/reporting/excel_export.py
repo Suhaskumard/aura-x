@@ -32,6 +32,22 @@ _HEADER_FONT = Font(bold=True)
 _REPOSITORY_SHEET_NAME = "Repository"
 _LANGUAGES_SHEET_NAME = "Languages"
 
+# openpyxl (and Excel/LibreOffice itself, on open) treats any string cell
+# value starting with one of these as a live formula -- classic CSV/Excel
+# injection (OWASP). Several fields here (repository.description above
+# all -- free text, entirely controlled by whoever owns the analyzed
+# GitHub repo, no character restrictions) are untrusted upstream data, so
+# every string written into a cell is neutralized before it reaches
+# openpyxl: prefixing with a single quote keeps the value visible as
+# plain text instead of letting Excel execute it.
+_FORMULA_TRIGGER_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _sanitize_cell_value(value: object) -> object:
+    if isinstance(value, str) and value.startswith(_FORMULA_TRIGGER_PREFIXES):
+        return "'" + value
+    return value
+
 
 def _identity_rows(repository: Repository, run: AnalysisRun) -> list[tuple[str, object]]:
     profile = run.result_profile or {}
@@ -71,7 +87,7 @@ def _write_identity_sheet(sheet: Worksheet, repository: Repository, run: Analysi
     for cell in sheet[1]:
         cell.font = _HEADER_FONT
     for field, value in _identity_rows(repository, run):
-        sheet.append([field, value])
+        sheet.append([field, _sanitize_cell_value(value)])
     sheet.column_dimensions["A"].width = 22
     sheet.column_dimensions["B"].width = 60
 
@@ -86,7 +102,7 @@ def _write_languages_sheet(sheet: Worksheet, run: AnalysisRun) -> None:
     total_bytes = sum(languages.values())
     for language, byte_count in sorted(languages.items(), key=lambda kv: (-kv[1], kv[0])):
         percentage = round(100 * byte_count / total_bytes, 2) if total_bytes else 0.0
-        sheet.append([language, byte_count, percentage])
+        sheet.append([_sanitize_cell_value(language), byte_count, percentage])
 
     sheet.column_dimensions["A"].width = 20
     sheet.column_dimensions["B"].width = 14

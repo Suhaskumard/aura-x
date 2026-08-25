@@ -35,7 +35,16 @@ export default function RepositoryProfileView({ repositoryId, onRefreshStarted }
         if (cancelled) return
         setProfile(profileResponse.profile)
         setBranches(branchList)
-        setSelectedBranch(profileResponse.profile.selected_branch ?? '')
+        // Fall back through default_branch and the first branch returned so the
+        // <select>'s value always matches a real <option> -- an empty string here
+        // matches no option, which makes the browser display the first branch
+        // while React's own state still thinks nothing is selected.
+        setSelectedBranch(
+          profileResponse.profile.selected_branch ??
+            profileResponse.profile.default_branch ??
+            branchList[0]?.name ??
+            '',
+        )
       })
       .catch((err: unknown) => {
         if (cancelled) return
@@ -179,6 +188,7 @@ export default function RepositoryProfileView({ repositoryId, onRefreshStarted }
         <p className="muted">Pick a different branch and re-run ingestion against it.</p>
         <div className="reanalyze-controls">
           <select
+            aria-label="Branch"
             value={selectedBranch}
             onChange={(event) => setSelectedBranch(event.target.value)}
             disabled={refreshing || branches.length === 0}

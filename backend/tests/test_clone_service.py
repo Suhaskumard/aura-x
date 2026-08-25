@@ -14,7 +14,7 @@ import pytest
 from app.core.config import Settings
 from app.domain.errors import CloneFailedError, RepositoryTooLargeError
 from app.services import clone_service
-from app.services.clone_service import clone_repository
+from app.services.clone_service import clone_repository, remove_workspace
 
 
 def _run_git(*args: str, cwd) -> None:
@@ -286,3 +286,25 @@ def test_clone_does_not_write_token_into_cloned_repo_config(source_repo, setting
 
     git_config = (target_dir / ".git" / "config").read_text(encoding="utf-8")
     assert secret not in git_config
+
+
+def test_remove_workspace_deletes_a_successfully_cloned_directory(source_repo, settings):
+    # git leaves some files under .git read-only on Windows -- the same
+    # condition clone_service's own failure-path cleanup already handles
+    # (see _force_remove_readonly) -- so a successful clone must be
+    # removable the same way once the pipeline is done with it.
+    source, _ = source_repo
+    target_dir = settings.workspace_root / "acme__widgets__cleanup"
+    clone_repository(
+        clone_url=str(source), owner="acme", repo="widgets", branch="main",
+        target_dir=str(target_dir), settings=settings,
+    )
+    assert target_dir.exists()
+
+    remove_workspace(target_dir)
+
+    assert not target_dir.exists()
+
+
+def test_remove_workspace_is_a_noop_for_a_nonexistent_path(tmp_path):
+    remove_workspace(tmp_path / "never-existed")  # must not raise

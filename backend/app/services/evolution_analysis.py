@@ -24,6 +24,15 @@ DEFAULT_RECENT_FILE_LIMIT = 20
 DEFAULT_CO_CHANGE_TOP_N = 20
 DEFAULT_CONCENTRATION_TOP_FRACTION = 0.2
 
+# combinations(paths, 2) is O(n^2) in the number of files a single commit
+# touches -- a mass-rename, vendor-update, or initial-import commit
+# touching thousands of files would otherwise generate millions of pairs
+# (~78s / a multi-GB dict for a 3000-file commit, measured). Such commits
+# aren't meaningful "these files tend to change together" signal anyway,
+# so co-change tracking is skipped for any commit past this size; its
+# file_churn/recently_changed contributions (both O(n)) are unaffected.
+DEFAULT_MAX_CO_CHANGE_FILES_PER_COMMIT = 100
+
 
 def compute_evolution_signals(
     commits: list[CommitInfo],
@@ -31,6 +40,7 @@ def compute_evolution_signals(
     recent_file_limit: int = DEFAULT_RECENT_FILE_LIMIT,
     co_change_top_n: int = DEFAULT_CO_CHANGE_TOP_N,
     concentration_top_fraction: float = DEFAULT_CONCENTRATION_TOP_FRACTION,
+    max_co_change_files_per_commit: int = DEFAULT_MAX_CO_CHANGE_FILES_PER_COMMIT,
 ) -> EvolutionSignals:
     file_stats: dict[str, dict] = {}
     co_change_counts: dict[tuple[str, str], int] = {}
@@ -59,9 +69,11 @@ def compute_evolution_signals(
                 seen.add(path)
                 recently_changed.append(path)
 
-        for file_a, file_b in combinations(sorted(set(paths)), 2):
-            key = (file_a, file_b)
-            co_change_counts[key] = co_change_counts.get(key, 0) + 1
+        unique_paths = sorted(set(paths))
+        if len(unique_paths) <= max_co_change_files_per_commit:
+            for file_a, file_b in combinations(unique_paths, 2):
+                key = (file_a, file_b)
+                co_change_counts[key] = co_change_counts.get(key, 0) + 1
 
     file_churn = sorted(
         (

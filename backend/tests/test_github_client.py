@@ -192,6 +192,23 @@ def test_get_paginated_malformed_page_raises(fast_settings):
             client.get_paginated("/repos/octocat/hello-world/commits", limit=10)
 
 
+@respx.mock
+def test_get_paginated_self_referencing_link_header_raises_instead_of_hanging(fast_settings):
+    """Regression: a Link header whose "next" URL never actually advances
+    (repeats the same URL, each page short of `per_page` items -- here,
+    empty) used to make get_paginated() loop forever instead of ever
+    reaching `limit` or running out of pages. A malformed/hostile upstream
+    must fail fast with a structured error, not hang the ingestion job."""
+    base_url = "https://api.github.com/repos/octocat/hello-world/commits"
+    respx.get(base_url).mock(
+        return_value=httpx.Response(200, json=[], headers={"Link": f'<{base_url}>; rel="next"'})
+    )
+
+    with GitHubApiClient(settings=fast_settings) as client:
+        with pytest.raises(MalformedUpstreamResponseError):
+            client.get_paginated("/repos/octocat/hello-world/commits", limit=10)
+
+
 def test_token_never_appears_in_default_headers_when_unset():
     settings = Settings(github_token=None)
     with GitHubApiClient(settings=settings) as client:

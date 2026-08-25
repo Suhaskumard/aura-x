@@ -21,23 +21,28 @@ docs/       Architecture, audit, and planning documents
 
 ## Status
 
-**Phase 15 of 16 complete** (see the plan above for the full phase list).
-GitHub repository ingestion is real end-to-end: paste a public repository
-URL in the dashboard and it validates the URL, fetches real metadata and
-branches, clones and scans the repository, detects languages/test
+**All 16 phases of the GitHub integration plan are complete.** A real
+public repository genuinely enters and completes the full pipeline: paste
+a URL in the dashboard and it validates the URL, fetches real metadata
+and branches, clones and scans the repository, detects languages/test
 frameworks/dependencies, computes Git evolution signals, persists
-everything, and renders a live-updating Repository Profile — all backed
-by the REST API below, no mock data or hardcoded results anywhere in the
-path. Downstream analysis modules (Repository Intelligence, Evolution
-Analysis, Dependency Analysis, Risk Assessment, Test Planning, Phase 12)
-and Excel export (Phase 14) exist and are tested but not yet wired into
-the ingestion flow or exposed via the API/dashboard. The backend test
-suite (unit, API-client, git-integration, API, and security tests,
-258 tests) is offline-safe by default with an opt-in network-integration
-tier, and runs in CI (`.github/workflows/backend-tests.yml`, Phase 15).
-Only Phase 16 (final end-to-end validation) remains. See
-`docs/GITHUB_INTEGRATION.md` for the current, detailed state of every
-phase.
+everything, renders a live-updating Repository Profile, and hands off to
+the downstream analysis stages (Repository Intelligence, Evolution
+Analysis, Dependency Analysis, Risk Assessment, Test Planning) — no mock
+data, hardcoded results, or simulated progress anywhere in that path.
+Excel export (identity block + language distribution) is available for
+any completed analysis. The backend test suite (unit, API-client,
+git-integration, API, and security tests, 264 tests) is offline-safe by
+default with an opt-in network-integration tier, and runs in CI
+(`.github/workflows/backend-tests.yml`).
+
+What's *not* yet built: downstream analysis results and Excel export
+aren't persisted or exposed via the API/dashboard (they run and are
+verified via logs/direct calls, not user-facing yet); there's no
+automated frontend test suite; `LocalRepositoryProvider`/`GitLabProvider`
+remain unimplemented. See `docs/GITHUB_INTEGRATION.md` — in particular
+"End-to-End Validation" and "Limitations (current)" — for the complete,
+current-state detail behind every phase.
 
 ## Backend setup
 
@@ -111,6 +116,26 @@ With both servers running (see setup above):
    frameworks, and dependencies. Use **Re-analyze this branch** to
    re-run ingestion against a different branch, picked from the
    repository's real branch list.
+5. Behind the scenes, the same completed run is also handed off to the
+   downstream analysis stages (Repository Intelligence, Evolution,
+   Dependency, Risk, Test Planning) — check the backend log for a
+   `Downstream analysis complete for ...` line. These results aren't
+   surfaced in the dashboard yet (see Status above).
+
+To export a completed analysis to Excel (no UI button yet — see Status):
+
+```bash
+cd backend
+python -c "
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from app.reporting.excel_export import save_repository_workbook
+
+engine = create_engine('YOUR_DATABASE_URL', future=True)
+db = sessionmaker(bind=engine, future=True)()
+save_repository_workbook(db, repository_id='...', analysis_run_id='...', path='report.xlsx')
+"
+```
 
 Equivalently, from the API directly:
 

@@ -239,3 +239,51 @@ def test_multiple_analysis_runs_per_repository_are_all_retained(db_session):
 
     runs = list_analysis_runs_for_repository(db_session, repository.id)
     assert {r.id for r in runs} == {run1.id, fail_first.id}
+
+
+# ---- Regression: concurrent first-time upsert_repository() for the same identity ----
+# Two callers can both call get_repository_by_identity() -> None for a
+# brand-new (provider, owner, name) before either has committed its
+# insert (e.g. two near-simultaneous POST /repositories/github requests
+# for a URL neither has ingested before). The loser used to hit
+# uq_repositories_provider_owner_name as a raw, unhandled IntegrityError
+# instead of converging on the row the winner just created.
+
+
+def test_concurrent_upsert_of_the_same_new_repository_identity_does_not_raise(db_engine):
+    import threading
+
+    from sqlalchemy.orm import sessionmaker
+
+    session_factory = sessionmaker(bind=db_engine, autoflush=False, autocommit=False, future=True)
+    barrier = threading.Barrier(2)
+    results: list[str] = []
+    errors: list[BaseException] = []
+
+    def _upsert() -> None:
+        session = session_factory()
+        try:
+            barrier.wait(timeout=5)
+            repository = upsert_repository(
+                session,
+                provider="github",
+                owner="octocat",
+                name="racy-repo",
+                source_url="https://github.com/octocat/racy-repo",
+            )
+            session.commit()
+            results.append(repository.id)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=_upsert) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(results) == 2
+    assert results[0] == results[1]  # both converge on the same row, not a raw IntegrityError

@@ -100,6 +100,18 @@ def _safe_rmtree(path: Path) -> None:
         shutil.rmtree(path, onerror=_force_remove_readonly)
 
 
+def remove_workspace(path: str | Path) -> None:
+    """Remove a clone workspace directory once nothing needs it on disk
+    any more (e.g. after the ingestion pipeline that cloned it has fully
+    finished with it -- see app/services/ingestion_orchestrator.py). Safe
+    to call on a path that doesn't exist. Uses the same Windows-safe
+    removal as the clone-failure cleanup paths above, since a successful
+    clone leaves the same read-only files under `.git`."""
+    resolved = Path(path)
+    if resolved.exists():
+        _safe_rmtree(resolved)
+
+
 def _directory_size_bytes(path: Path) -> int:
     return sum(
         entry.stat().st_size

@@ -1,8 +1,8 @@
 # AURA-X GitHub Integration
 
 Living document. Updated at the end of every phase in
-`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 15
-(comprehensive test suite).
+`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 16
+(end-to-end validation) — the final phase of the GitHub integration plan.
 
 ## Architecture
 
@@ -23,10 +23,15 @@ Living document. Updated at the end of every phase in
    ▼             ▼                                       ▼
 Repository   Evolution / Risk / Test                 Reporting
 Intelligence     Planning                            (API / Dashboard / Excel)
-(app/analysis/, Phase 12)                             (partial: API is
-                                                        Phase 10/11;
-                                                        Dashboard/Excel
-                                                        not yet built)
+(app/analysis/, Phase 12;                             API: Phase 10/11
+ run after every                                      Dashboard: Phase 13
+ successful ingestion                                 Excel: Phase 14
+ as of Phase 16)                                      (all three read
+                                                        Repository/AnalysisRun,
+                                                        not RepositoryContext
+                                                        directly, since that
+                                                        object doesn't outlive
+                                                        one ingestion run)
 ```
 
 **Rule:** everything below the `RepositoryContext` line depends only on
@@ -753,14 +758,16 @@ runtime cross-check.
 ### Not yet done
 
 Per the phase's own deliverable list ("downstream module entry points"
-only), Phase 12 stops at the service layer: `run_downstream_analysis` is
-not called from the ingestion job (Phase 11), not exposed via the API,
-and its reports aren't persisted. Nothing in the remaining plan (Phase
-13 Dashboard, Phase 14 Excel, Phase 15 test suite, Phase 16 end-to-end
-validation) allocates that wiring to a specific phase either — Phase 16's
-walkthrough explicitly ends with "hand off to downstream analysis" as
-the last step, matching this phase's scope of exposing the entry points
-without yet wiring them to run automatically.
+only), Phase 12 itself stopped at the service layer. **Update (Phase
+16):** `run_downstream_analysis` is now actually called -- see "End-to-
+End Validation" below for `_hand_off_to_downstream_analysis` in
+`app/services/ingestion_orchestrator.py`, which runs it against every
+successfully-completed ingestion's `RepositoryContext` and logs a
+summary. Its reports are still **not persisted** (no DB columns) and
+**not exposed via the API** -- only the execution itself (the "hand off"
+Phase 16's walkthrough names as the pipeline's last step) is wired in;
+turning the results into queryable, API-visible data remains future
+work.
 
 ## Dashboard Integration (Phase 13 — implemented)
 
@@ -1006,6 +1013,150 @@ isolate away from the rest of the suite, not a regression -- the same
 six tests were confirmed passing earlier in this session (Phase 13) once
 the quota had reset, and `RATE_LIMITED` was itself the intended,
 correctly-classified error, not an unhandled exception.
+
+## End-to-End Validation (Phase 16 — implemented)
+
+The GitHub integration plan's final phase. Three things changed in the
+code; the rest of this phase is verification of what Phases 1-15 already
+built.
+
+### The hand-off to downstream analysis is now real
+
+`app/services/ingestion_orchestrator.py::_hand_off_to_downstream_analysis`
+-- called from `run_ingestion_job` immediately after
+`complete_analysis_run`, i.e. once a run has genuinely reached `READY`.
+It calls Phase 12's `run_downstream_analysis(context)` against the
+same in-memory `RepositoryContext` that was just used to build the
+persisted profile, and logs a one-line summary (primary language, size
+classification, churn pattern, high-risk file count, test-recommendation
+count, dependency count). This is the "hand off to downstream analysis"
+step named in this phase's own walkthrough task -- previously true only
+as a directly-callable, tested capability (Phase 12); now it actually
+executes for every successful ingestion.
+
+Deliberately still narrow in scope: wrapped in its own `try`/`except`
+so a bug in an unrelated analysis module can never turn a successful
+ingestion into a failure (`tests/test_downstream_handoff.py` and the
+three hand-off tests in `tests/test_ingestion_job.py` cover this), and
+still **not persisted or exposed via the API** -- only the execution
+itself changed, not Phase 12's "not yet done" scope for storage/exposure
+(see "Downstream analysis" above).
+
+No new endpoint was needed for this -- the hand-off's summary is
+diagnostic-only (a log line), not a user-facing result.
+
+### Reproducibility
+
+The plan allows either "reuses valid cached analysis for that exact
+commit SHA" or "produces a fresh, consistent run" -- this system takes
+the second, simpler option: there is no analysis cache, every ingestion
+or refresh re-runs the full pipeline (see "Asynchronous ingestion
+orchestration" above). What needed proving was that repeat runs against
+unchanged upstream data are genuinely *consistent* — `tests/test_
+reproducibility.py` (new) does this: re-ingesting the same repository via
+`.../refresh` twice, with the mocked GitHub responses unchanged between
+runs, asserts the resolved branch and commit SHA match both times, the
+same `Repository` row is reused (not duplicated) across three consecutive
+runs, and every substantive profile field (languages, test frameworks,
+dependencies, file inventory, commit count) is byte-for-byte identical
+between the two runs -- proving there's no hidden source of
+non-determinism (e.g. unstable set/dict iteration order) that could make
+two analyses of the same commit silently disagree.
+
+### No mock data, hardcoded values, or fake progress
+
+Verified by direct inspection, not assumed:
+
+- `grep`'d `backend/app/` and `frontend/src/` (production code only,
+  tests excluded -- tests are supposed to mock/fixture, that's correct)
+  for `TODO`/`FIXME`/`XXX`/`HACK` and for `mock`/`fake`/`stub`/
+  `placeholder`/`dummy`/`hardcoded` (case-insensitive) -- the only hits
+  were in comments describing what the code deliberately does *not* do
+  (`"the connection string is never hardcoded"`,
+  `"...passed through unchanged"` referring to a parameter named
+  `stub`/`fixture` in a docstring), and one HTML `placeholder=` form
+  attribute (a UI hint, not fake data).
+- `frontend/src/`: the only `setTimeout` in the entire dashboard is
+  `usePolling.ts`'s real polling interval -- there is no
+  animation-driven or timer-driven progress bar anywhere;
+  `IngestionProgress.tsx` renders exactly what the last poll of
+  `GET .../analysis-runs/{id}` returned.
+- The live demo below is itself the strongest evidence: every number
+  shown in the dashboard, returned by the API, and written into the
+  Excel workbook traces back to a real GitHub API response or a real
+  `git`/filesystem scan of a real clone -- nothing is seeded or
+  precomputed.
+
+### Signed-off end-to-end demo
+
+Run against `github.com/psf/requests` (real, live, no test doubles) with
+both servers running against a temporary SQLite database:
+
+1. **Dashboard → API**: pasted the URL in the onboarding form (no
+   branch specified). `POST /api/v1/repositories/github` enqueued
+   ingestion and returned `202`/`QUEUED` immediately.
+2. **Real pipeline, live progress**: the dashboard polled
+   `GET .../analysis-runs/{id}` and rendered each real stage as it
+   happened (backend logs confirm the actual GitHub API calls --
+   metadata, branches, commits, languages, and one per-commit
+   file-changes call per analyzed commit -- interleaved with each
+   status transition, not batched or simulated).
+3. **Persistence**: `Repository`/`Branch`/`Commit`/`AnalysisRun` rows
+   written via `app.db.repository_dao`, confirmed by querying the API
+   after completion.
+4. **Hand-off**: backend log --
+   `Downstream analysis complete for psf/requests (commit
+   5460f467b02e...): primary_language=Python size=medium
+   churn_pattern=distributed high_risk_files=1 test_recommendations=1
+   dependencies=6` -- real numbers computed from the real clone and the
+   real commit history, not placeholders.
+5. **Dashboard render**: the completed Repository Profile --
+   `psf/requests`, branch `main`, commit `5460f467b02e...`, 125 files /
+   3.6 MB / 200 commits analyzed, language bars (Python 79.2%,
+   reStructuredText 10.4%, Markdown 8.3%, YAML/TOML/Makefile/HTML/CSS
+   the remainder), test frameworks `pytest`/`tox`, 6 dependencies
+   (`httpbin`, `pytest`, `pytest-cov`, `pytest-httpbin`, `trustme`,
+   `wheel`) -- confirmed rendered in a real browser.
+6. **Excel export**: `save_repository_workbook()` called directly
+   against that same completed `AnalysisRun`, producing a real `.xlsx`
+   file; reloaded with `openpyxl` and every field cross-checked against
+   the dashboard/API values above -- identical (repository URL, branch,
+   commit SHA, stats, and the full language distribution table).
+
+No step was mocked, stubbed, or hand-seeded. This is the same repository
+already used for Phase 13's dashboard walkthrough, re-run fresh for this
+phase to also exercise the Phase 16 additions (the downstream-analysis
+hand-off) and the Excel export path together in one pass.
+
+### Finalized docs
+
+This document and the root `README.md` were reviewed end-to-end for this
+phase: stale forward-references from earlier phases describing
+not-yet-built features ("Dashboard/Excel not yet built" in the
+Architecture diagram, "not called from the ingestion job" for the
+downstream-analysis hand-off) were corrected to reflect the shipped
+state; `README.md`'s "Status" section, backend/frontend setup
+instructions (including `alembic upgrade head`, previously missing),
+and "How to analyze a repository" section were brought up to date in
+Phase 13-15 and re-checked here for accuracy against the actual current
+API/dashboard behavior.
+
+### What's still open after Phase 16
+
+The GitHub integration plan's 16 phases are complete, but "AURA-X" as
+described in `README.md`'s opening paragraph is larger than this plan:
+
+- Downstream analysis results (Phase 12) execute on every ingestion
+  (Phase 16) but are not persisted or queryable via the API/dashboard.
+- Excel export (Phase 14) has no API route or dashboard button.
+- No automated frontend tests (no phase in this plan scoped them).
+- CI (`.github/workflows/backend-tests.yml`, Phase 15) has not yet run
+  on GitHub's actual infrastructure -- authored and verified to mirror
+  local commands exactly, but unexercised by a real push/PR/Actions run.
+- `LocalRepositoryProvider`/`GitLabProvider` remain unimplemented (named
+  in the abstraction since Phase 2/3).
+
+See "Limitations (current)" below for the complete, itemized list.
 
 ## Authentication
 

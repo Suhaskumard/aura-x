@@ -7,14 +7,27 @@ into a JSON body of exactly `exc.to_dict()` (`{"code": ..., "message":
 ...}`) with an appropriate status code -- never a raw exception, stack
 trace, or FastAPI's default 500 body. This is the single place that
 mapping lives, so a new error code only needs an entry added here.
+
+A genuinely unexpected exception (a bug, not a translated
+RepositoryIntegrationError) also gets a handler below: without one,
+Starlette's own default returns a bare `text/plain "Internal Server
+Error"` body, breaking every API client's assumption that error
+responses are JSON `{"code": ..., "message": ...}`. The handler logs the
+real exception server-side (never in the response, so nothing internal
+-- a path, a query, a secret -- ever reaches the client) and returns a
+generic 500 in the same shape as every other error.
 """
 
 from __future__ import annotations
+
+import logging
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.domain.errors import RepositoryIntegrationError
+
+logger = logging.getLogger(__name__)
 
 _STATUS_BY_CODE: dict[str, int] = {
     "INVALID_REPOSITORY_URL": 400,
@@ -44,5 +57,14 @@ async def _repository_integration_error_handler(
     return JSONResponse(status_code=status_code, content=exc.to_dict())
 
 
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("Unhandled exception while processing %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=_DEFAULT_STATUS,
+        content={"code": "INTERNAL_ERROR", "message": "An unexpected error occurred."},
+    )
+
+
 def register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(RepositoryIntegrationError, _repository_integration_error_handler)
+    app.add_exception_handler(Exception, _unhandled_exception_handler)

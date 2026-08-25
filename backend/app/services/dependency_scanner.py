@@ -36,8 +36,12 @@ def _parse_package_json(path: Path) -> list[str]:
         return []
     if not isinstance(payload, dict):
         return []
-    deps = {**(payload.get("dependencies") or {}), **(payload.get("devDependencies") or {})}
-    return sorted(deps.keys())
+    names: set[str] = set()
+    for key in ("dependencies", "devDependencies"):
+        section = payload.get(key)
+        if isinstance(section, dict):
+            names.update(section.keys())
+    return sorted(names)
 
 
 _MANIFEST_PARSERS = {

@@ -115,3 +115,40 @@ def test_change_concentration_is_between_zero_and_one():
     ]
     signals = compute_evolution_signals(commits)
     assert 0.0 < signals.change_concentration <= 1.0
+
+
+# ---- Regression: a mass-change commit must not blow up co-change computation ----
+# combinations(paths, 2) is O(n^2) in a single commit's touched-file count.
+# An initial-import or vendor-update commit touching thousands of files
+# used to generate millions of pairs (~79s / a huge dict for 3000 files,
+# measured before the fix) -- file_churn/recently_changed stay accurate
+# for such a commit; only its (not meaningful) co-change pairing is
+# skipped once it exceeds max_co_change_files_per_commit.
+
+
+def test_mass_change_commit_skips_co_change_pairing_but_keeps_churn():
+    huge_commit = commit("huge", [fc(f"file{i}.py") for i in range(500)])
+    signals = compute_evolution_signals([huge_commit], max_co_change_files_per_commit=100)
+    assert signals.co_changes == []  # pairing skipped -- commit exceeds the cap
+    assert len(signals.file_churn) == 500  # churn/count stats still computed per file
+    assert signals.recently_changed_files  # recently-changed tracking unaffected
+
+
+def test_mass_change_commit_does_not_suppress_co_changes_from_other_commits():
+    huge_commit = commit("huge", [fc(f"file{i}.py") for i in range(500)])
+    small_commit_a = commit("a", [fc("x.py"), fc("y.py")], days_ago=1)
+    small_commit_b = commit("b", [fc("x.py"), fc("y.py")], days_ago=2)
+    signals = compute_evolution_signals(
+        [huge_commit, small_commit_a, small_commit_b], max_co_change_files_per_commit=100
+    )
+    assert any(pair.file_a == "x.py" and pair.file_b == "y.py" for pair in signals.co_changes)
+
+
+def test_compute_evolution_signals_stays_fast_for_a_large_single_commit():
+    import time
+
+    huge_commit = commit("huge", [fc(f"file{i}.py") for i in range(3000)])
+    started = time.perf_counter()
+    compute_evolution_signals([huge_commit])
+    elapsed = time.perf_counter() - started
+    assert elapsed < 5.0  # was ~79s before the O(n^2) co-change cap

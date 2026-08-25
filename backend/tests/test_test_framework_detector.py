@@ -59,6 +59,16 @@ def test_malformed_package_json_does_not_raise(tmp_path):
     assert frameworks == []
 
 
+def test_package_json_with_dependencies_as_wrong_shape_does_not_raise(tmp_path):
+    # Well-formed JSON, but "devDependencies" isn't the {name: version}
+    # object npm's schema requires (a hand-edited/corrupted manifest) --
+    # must be skipped, not crash the whole detection pass.
+    payload = {"devDependencies": ["jest"]}
+    (tmp_path / "package.json").write_text(json.dumps(payload), encoding="utf-8")
+    frameworks = detect_test_frameworks(tmp_path, [])
+    assert frameworks == []
+
+
 def test_detect_test_directories_finds_conventional_names():
     file_tree = [
         entry("tests/test_app.py"),

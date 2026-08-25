@@ -1,16 +1,25 @@
 """
-End-to-end ingestion orchestration (Phase 10): URL -> validate -> fetch
-metadata -> resolve branch -> fetch commit history -> clone -> scan/detect
-(Phase 8) -> persist (Phase 9). This is what the REST API layer
-(app/api/v1/routes/repositories.py) calls; it's synchronous for now --
-Phase 11 moves it to a background job without changing this function's
-contract.
+Asynchronous ingestion orchestration (Phase 11).
 
-A malformed/unsupported URL fails fast with nothing persisted (there's no
-valid owner/repo to record yet). Once a RepositoryContext exists (URL
-parsed successfully), any failure is captured onto it and still persisted
-as a FAILED AnalysisRun -- see docs/GITHUB_INTEGRATION.md "Database
-Persistence" for why that's diagnosable rather than a silent 500.
+Two halves, matching FastAPI's BackgroundTasks split:
+
+- enqueue_ingestion() / enqueue_refresh() -- fast and synchronous. Validate
+  the URL, upsert a minimal Repository row, create a PENDING AnalysisRun,
+  and return immediately. This is all a route handler does before
+  responding -- the frontend is never blocked on the actual pipeline.
+- run_ingestion_job() -- the real pipeline (Phase 4-8), run as a
+  BackgroundTask after the HTTP response has already been sent. Opens its
+  own DB session (via an injected `session_factory`, not the request's
+  now-closed one) and transitions the persisted AnalysisRun.status live,
+  at each stage boundary, exactly when that stage genuinely starts --
+  never a replay after the fact, so a concurrent GET sees real progress.
+
+A malformed/unsupported URL fails fast in enqueue_ingestion() with
+nothing persisted (there's no valid owner/repo to record yet). Every
+failure from FETCHING_METADATA onward happens inside run_ingestion_job()
+and is captured onto the already-persisted AnalysisRun as FAILED with a
+structured error -- see docs/GITHUB_INTEGRATION.md "Database Persistence"
+for why that's diagnosable rather than a silent hang.
 """
 
 from __future__ import annotations
@@ -18,10 +27,20 @@ from __future__ import annotations
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings
-from app.db.repository_dao import get_repository_by_id
+from app.db.repository_dao import (
+    complete_analysis_run,
+    create_analysis_run,
+    fail_analysis_run,
+    get_analysis_run,
+    get_repository_by_id,
+    transition_analysis_run,
+    upsert_branches,
+    upsert_commits,
+    upsert_repository,
+)
 from app.domain.errors import (
     RepositoryIntegrationError,
     RepositoryNotFoundError,
@@ -31,97 +50,158 @@ from app.domain.github_url import parse_github_url
 from app.domain.repository_context import IngestionStatus, RepositoryContext
 from app.domain.repository_provider import get_provider_class_for_host
 from app.models.analysis_run import AnalysisRun
-from app.services.ingestion_persistence import build_config_snapshot, persist_repository_context
+from app.services.ingestion_persistence import build_config_snapshot
 from app.services.repository_service import (
     DEFAULT_EVOLUTION_COMMIT_LIMIT,
     assemble_repository_context,
     build_clone_target_dir,
+    build_repository_profile,
     select_branch,
 )
 
 # This module lives inside the app.services package, so importing it
 # already runs app/services/__init__.py first, which registers
 # GitHubProvider (and any future provider) against
-# app.domain.repository_provider -- get_provider_class_for_host() below
+# app.domain.repository_provider -- _provider_class_for_source_url() below
 # always sees it.
 
 
-def ingest_github_repository(
-    db: Session,
-    settings: Settings,
-    *,
-    repository_url: str,
-    branch: str | None,
-    evolution_commit_limit: int = DEFAULT_EVOLUTION_COMMIT_LIMIT,
-) -> AnalysisRun:
-    """Run the full ingestion pipeline for `repository_url` and persist the
-    result. Returns the persisted AnalysisRun (READY or FAILED)."""
-    parsed = parse_github_url(repository_url)  # raises before anything is persisted
-    provider_cls = get_provider_class_for_host(urlparse(parsed.normalized_url).hostname or "")
+def _provider_class_for_source_url(source_url: str):
+    provider_cls = get_provider_class_for_host(urlparse(source_url).hostname or "")
     if provider_cls is None:  # pragma: no cover - parse_github_url already restricts the host set
-        raise UnsupportedRepositoryProviderError(f"No provider registered for {parsed.normalized_url}")
-
-    context = RepositoryContext(
-        repository_id=str(uuid4()),
-        provider=provider_cls.name,
-        source_url=parsed.normalized_url,
-        owner=parsed.owner,
-        repository_name=parsed.repository,
-    )
-    context.transition_to(IngestionStatus.VALIDATING)
-
-    provider = provider_cls(settings=settings)
-    try:
-        context.transition_to(IngestionStatus.FETCHING_METADATA)
-        context.metadata = provider.fetch_metadata(context.owner, context.repository_name)
-        context.default_branch = context.metadata.default_branch
-
-        context.transition_to(IngestionStatus.FETCHING_BRANCHES)
-        context.branches = provider.list_branches(context.owner, context.repository_name)
-        selected = select_branch(context.branches, branch)
-        context.selected_branch = selected.name
-        context.git_history = provider.get_commit_history(
-            context.owner, context.repository_name, selected.name, limit=settings.max_commit_history
-        )
-        context.languages = provider.get_languages(context.owner, context.repository_name)
-
-        context.transition_to(IngestionStatus.CLONING)
-        target_dir = build_clone_target_dir(settings, context.owner, context.repository_name)
-        clone_result = provider.clone(context.owner, context.repository_name, selected.name, target_dir)
-        context.local_path = clone_result.local_path
-        context.commit_sha = clone_result.commit_sha
-
-        assemble_repository_context(context, provider=provider, evolution_commit_limit=evolution_commit_limit)
-    except RepositoryIntegrationError as exc:
-        context.fail(exc.to_dict())
-    finally:
-        close = getattr(provider, "close", None)
-        if callable(close):
-            close()
-
-    config_snapshot = build_config_snapshot(settings, evolution_commit_limit=evolution_commit_limit)
-    return persist_repository_context(db, context, config_snapshot=config_snapshot)
+        raise UnsupportedRepositoryProviderError(f"No provider registered for {source_url}")
+    return provider_cls
 
 
-def refresh_repository_ingestion(
-    db: Session,
-    settings: Settings,
-    *,
-    repository_id: str,
-    branch: str | None,
-    evolution_commit_limit: int = DEFAULT_EVOLUTION_COMMIT_LIMIT,
+def enqueue_ingestion(
+    db: Session, settings: Settings, *, repository_url: str, branch: str | None
 ) -> AnalysisRun:
-    """Re-run ingestion for an already-known repository, using its stored
-    source_url. Adds a new AnalysisRun to the same Repository row rather
-    than creating a duplicate -- see upsert_repository()."""
+    """Validate `repository_url`, upsert the Repository row, and create a
+    PENDING AnalysisRun. Fast -- no network/filesystem access. Hand the
+    returned run's id to run_ingestion_job() (as a background task) to
+    actually perform the ingestion."""
+    parsed = parse_github_url(repository_url)  # raises before anything is persisted
+    provider_cls = _provider_class_for_source_url(parsed.normalized_url)
+
+    repository = upsert_repository(
+        db,
+        provider=provider_cls.name,
+        owner=parsed.owner,
+        name=parsed.repository,
+        source_url=parsed.normalized_url,
+        repository_id=str(uuid4()),
+    )
+    config_snapshot = build_config_snapshot(settings, evolution_commit_limit=DEFAULT_EVOLUTION_COMMIT_LIMIT)
+    run = create_analysis_run(
+        db, repository, branch_name=branch, commit_sha=None, config_snapshot=config_snapshot
+    )
+    db.commit()
+    return run
+
+
+def enqueue_refresh(
+    db: Session, settings: Settings, *, repository_id: str, branch: str | None
+) -> AnalysisRun:
+    """Same as enqueue_ingestion(), but for an already-known repository --
+    reuses its stored source_url, adding a new AnalysisRun rather than
+    creating a duplicate Repository row."""
     repository = get_repository_by_id(db, repository_id)
     if repository is None:
         raise RepositoryNotFoundError(f"No repository with id {repository_id!r}")
+    return enqueue_ingestion(db, settings, repository_url=repository.source_url, branch=branch)
 
-    return ingest_github_repository(
-        db,
-        settings,
-        repository_url=repository.source_url,
-        branch=branch,
-        evolution_commit_limit=evolution_commit_limit,
-    )
+
+def _advance(db: Session, run: AnalysisRun, context: RepositoryContext, status: IngestionStatus) -> None:
+    """Transition both the persisted AnalysisRun and the in-memory
+    RepositoryContext to `status` together and commit, so a concurrent
+    GET observes this stage the moment it genuinely starts."""
+    transition_analysis_run(db, run, status)
+    context.transition_to(status)
+    db.commit()
+
+
+def run_ingestion_job(run_id: str, *, settings: Settings, session_factory: sessionmaker) -> None:
+    """The actual ingestion pipeline for an already-enqueued AnalysisRun.
+    Meant to run as a FastAPI BackgroundTask -- opens its own session via
+    `session_factory` (see app.db.session.get_session_factory) since the
+    request that enqueued this has already returned its response by the
+    time this runs."""
+    db = session_factory()
+    try:
+        run = get_analysis_run(db, run_id)
+        if run is None:  # pragma: no cover - defensive; the row was just created by enqueue_ingestion
+            return
+        repository = get_repository_by_id(db, run.repository_id)
+        requested_branch = run.branch_name  # None means "use the default branch"
+
+        context = RepositoryContext(
+            repository_id=repository.id,
+            provider=repository.provider,
+            source_url=repository.source_url,
+            owner=repository.owner,
+            repository_name=repository.name,
+        )
+        evolution_commit_limit = run.config_snapshot.get("evolution_commit_limit", DEFAULT_EVOLUTION_COMMIT_LIMIT)
+
+        provider_cls = _provider_class_for_source_url(repository.source_url)
+        provider = provider_cls(settings=settings)
+        try:
+            _advance(db, run, context, IngestionStatus.VALIDATING)
+
+            _advance(db, run, context, IngestionStatus.FETCHING_METADATA)
+            context.metadata = provider.fetch_metadata(context.owner, context.repository_name)
+            context.default_branch = context.metadata.default_branch
+            upsert_repository(
+                db,
+                provider=repository.provider,
+                owner=repository.owner,
+                name=repository.name,
+                source_url=repository.source_url,
+                metadata=context.metadata,
+                repository_id=repository.id,
+            )
+            db.commit()
+
+            _advance(db, run, context, IngestionStatus.FETCHING_BRANCHES)
+            context.branches = provider.list_branches(context.owner, context.repository_name)
+            selected = select_branch(context.branches, requested_branch)
+            context.selected_branch = selected.name
+            run.branch_name = selected.name  # record the resolved branch, not just what was requested
+            upsert_branches(db, repository, context.branches)
+            context.git_history = provider.get_commit_history(
+                context.owner, context.repository_name, selected.name, limit=settings.max_commit_history
+            )
+            context.languages = provider.get_languages(context.owner, context.repository_name)
+            db.commit()
+
+            _advance(db, run, context, IngestionStatus.CLONING)
+            target_dir = build_clone_target_dir(settings, context.owner, context.repository_name)
+            clone_result = provider.clone(context.owner, context.repository_name, selected.name, target_dir)
+            context.local_path = clone_result.local_path
+            context.commit_sha = clone_result.commit_sha
+            run.commit_sha = clone_result.commit_sha
+            db.commit()
+
+            # assemble_repository_context() transitions the in-memory
+            # context CLONING -> SCANNING -> READY/FAILED itself (Phase
+            # 8's own contract) -- only the persisted side is mirrored
+            # here, so it isn't double-transitioned.
+            transition_analysis_run(db, run, IngestionStatus.SCANNING)
+            db.commit()
+            assemble_repository_context(context, provider=provider, evolution_commit_limit=evolution_commit_limit)
+
+            upsert_commits(db, repository, context.git_history)
+            if context.analysis_status == IngestionStatus.READY:
+                complete_analysis_run(db, run, result_profile=build_repository_profile(context))
+            else:
+                fail_analysis_run(db, run, context.last_error or {})
+            db.commit()
+        except RepositoryIntegrationError as exc:
+            fail_analysis_run(db, run, exc.to_dict())
+            db.commit()
+        finally:
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
+    finally:
+        db.close()

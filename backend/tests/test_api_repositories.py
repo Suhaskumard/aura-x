@@ -1,14 +1,23 @@
 """
-Phase 10: /api/v1/repositories API tests.
+Phase 10/11: /api/v1/repositories API tests.
 
 Mocks the GitHub HTTP boundary (respx, same pattern as
 tests/test_github_provider.py) and the clone step (monkeypatching
 app.services.github_provider.clone_repository to point at a real local
 fixture tree, same pattern as test_github_provider.py's clone tests) --
-so these exercise the real ingestion_orchestrator -> assemble_repository_
-context -> persist_repository_context pipeline end-to-end through the
-actual HTTP routes, with only the two true external boundaries (GitHub's
-API, and `git`) faked.
+so these exercise the real route -> ingestion_orchestrator ->
+assemble_repository_context -> DAO pipeline end-to-end through the actual
+HTTP routes, with only the two true external boundaries (GitHub's API,
+and `git`) faked.
+
+Ingestion is asynchronous (Phase 11): POST .../github and .../refresh
+return 202 with status "QUEUED" immediately, and the pipeline runs as a
+FastAPI BackgroundTask. Starlette's TestClient runs background tasks to
+completion as part of the same client.post(...) call (verified: the
+*response body* reflects state as of before the background task ran, but
+by the time client.post() returns to the test, the DB is already fully
+updated) -- so these tests call POST once and then issue follow-up GETs
+to observe the final, real state, without any sleep/poll loop.
 """
 
 from __future__ import annotations
@@ -116,14 +125,22 @@ def test_ingest_valid_public_repository_end_to_end(api_client, monkeypatch, tmp_
             json={"repository_url": "https://github.com/octocat/hello-world"},
         )
 
-    assert response.status_code == 201
+    assert response.status_code == 202
     body = response.json()
-    assert body["status"] == "READY"
+    assert body["status"] == "QUEUED"
     assert body["owner"] == "octocat"
     assert body["name"] == "hello-world"
-    assert body["selected_branch"] == "main"
-    assert body["commit_sha"] == "sha-main"
+    assert body["commit_sha"] is None  # not resolved yet at enqueue time
     repository_id = body["repository_id"]
+    run_id = body["analysis_run_id"]
+
+    # By the time client.post() returned above, TestClient had already run
+    # the BackgroundTask to completion -- these reads see the final state.
+    run_status = api_client.get(f"/api/v1/repositories/{repository_id}/analysis-runs/{run_id}").json()
+    assert run_status["status"] == "READY"
+    assert run_status["branch_name"] == "main"
+    assert run_status["commit_sha"] == "sha-main"
+    assert run_status["completed_at"] is not None
 
     detail = api_client.get(f"/api/v1/repositories/{repository_id}").json()
     assert detail["primary_language"] == "Python"
@@ -173,8 +190,12 @@ def test_ingest_selects_requested_branch(api_client, monkeypatch, tmp_path):
             json={"repository_url": "https://github.com/octocat/hello-world", "branch": "dev"},
         )
 
-    assert response.status_code == 201
-    assert response.json()["selected_branch"] == "dev"
+    assert response.status_code == 202
+    repository_id = response.json()["repository_id"]
+    run_id = response.json()["analysis_run_id"]
+    run_status = api_client.get(f"/api/v1/repositories/{repository_id}/analysis-runs/{run_id}").json()
+    assert run_status["status"] == "READY"
+    assert run_status["branch_name"] == "dev"
 
 
 def test_ingest_unknown_branch_persists_failed_run(api_client, monkeypatch, tmp_path):
@@ -186,12 +207,16 @@ def test_ingest_unknown_branch_persists_failed_run(api_client, monkeypatch, tmp_
             json={"repository_url": "https://github.com/octocat/hello-world", "branch": "does-not-exist"},
         )
 
-    assert response.status_code == 201
-    body = response.json()
-    assert body["status"] == "FAILED"
-    assert body["error_code"] == "BRANCH_NOT_FOUND"
+    assert response.status_code == 202
+    repository_id = response.json()["repository_id"]
+    run_id = response.json()["analysis_run_id"]
 
-    profile = api_client.get(f"/api/v1/repositories/{body['repository_id']}/profile")
+    run_status = api_client.get(f"/api/v1/repositories/{repository_id}/analysis-runs/{run_id}").json()
+    assert run_status["status"] == "FAILED"
+    assert run_status["error_code"] == "BRANCH_NOT_FOUND"
+    assert run_status["completed_at"] is not None
+
+    profile = api_client.get(f"/api/v1/repositories/{repository_id}/profile")
     assert profile.status_code == 409
     assert profile.json()["code"] == "ANALYSIS_NOT_READY"
 
@@ -200,6 +225,21 @@ def test_get_unknown_repository_returns_404(api_client):
     response = api_client.get("/api/v1/repositories/does-not-exist")
     assert response.status_code == 404
     assert response.json()["code"] == "REPOSITORY_NOT_FOUND"
+
+
+def test_get_unknown_analysis_run_returns_404(api_client, monkeypatch, tmp_path):
+    patch_clone(monkeypatch, tmp_path)
+    with respx.mock:
+        mock_github(respx)
+        response = api_client.post(
+            "/api/v1/repositories/github",
+            json={"repository_url": "https://github.com/octocat/hello-world"},
+        )
+    repository_id = response.json()["repository_id"]
+
+    not_found = api_client.get(f"/api/v1/repositories/{repository_id}/analysis-runs/does-not-exist")
+    assert not_found.status_code == 404
+    assert not_found.json()["code"] == "REPOSITORY_NOT_FOUND"
 
 
 def test_refresh_reuses_repository_and_adds_analysis_run(api_client, monkeypatch, tmp_path):
@@ -213,11 +253,17 @@ def test_refresh_reuses_repository_and_adds_analysis_run(api_client, monkeypatch
 
     with respx.mock:
         mock_github(respx)
-        second = api_client.post(f"/api/v1/repositories/{first['repository_id']}/refresh", json={}).json()
+        second = api_client.post(f"/api/v1/repositories/{first['repository_id']}/refresh", json={})
 
-    assert second["repository_id"] == first["repository_id"]
-    assert second["analysis_run_id"] != first["analysis_run_id"]
-    assert second["status"] == "READY"
+    assert second.status_code == 202
+    second_body = second.json()
+    assert second_body["repository_id"] == first["repository_id"]
+    assert second_body["analysis_run_id"] != first["analysis_run_id"]
+
+    run_status = api_client.get(
+        f"/api/v1/repositories/{first['repository_id']}/analysis-runs/{second_body['analysis_run_id']}"
+    ).json()
+    assert run_status["status"] == "READY"
 
 
 def test_refresh_unknown_repository_returns_404(api_client):
@@ -241,6 +287,7 @@ def test_pagination_on_repository_list(api_client, monkeypatch, tmp_path):
     assert len(page1["items"]) == 1
     assert page1["page"] == 1
     assert page1["page_size"] == 1
+    assert page1["items"][0]["latest_status"] == "READY"
 
     page2 = api_client.get("/api/v1/repositories", params={"page": 2, "page_size": 1}).json()
     assert len(page2["items"]) == 1
@@ -278,6 +325,9 @@ def test_auth_required_when_api_auth_token_configured(api_client):
             headers={"Authorization": "Bearer wrong-token"},
         )
         assert wrong_token.status_code == 401
+
+        # nothing was enqueued -- auth is enforced before enqueue_ingestion runs
+        assert api_client.get("/api/v1/repositories").json()["total"] == 0
     finally:
         app.dependency_overrides.pop(get_settings, None)
 

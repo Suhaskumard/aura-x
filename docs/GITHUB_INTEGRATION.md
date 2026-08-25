@@ -1,8 +1,8 @@
 # AURA-X GitHub Integration
 
 Living document. Updated at the end of every phase in
-`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 10
-(REST API layer).
+`docs/GITHUB_INTEGRATION_PLAN.pdf`. This revision covers Phase 11
+(asynchronous status tracking).
 
 ## Architecture
 
@@ -429,12 +429,12 @@ valid transition) without claiming which stage it reached first.
 `build_config_snapshot(settings, evolution_commit_limit=...)` builds the
 non-secret config snapshot.
 
-Called from an API route as of Phase 10 --
-`app/services/ingestion_orchestrator.py::ingest_github_repository` calls
-`assemble_repository_context` (Phase 8) then `persist_repository_context`
-(this module) in sequence, synchronously within
-`POST /api/v1/repositories/github`; Phase 11 moves this to a background
-job without changing the sequence itself.
+Used directly by `POST /api/v1/repositories/github` in Phase 10. As of
+Phase 11, the live background job (`run_ingestion_job`, see "REST API
+Layer" below) persists incrementally as it runs instead of calling this
+function -- `persist_repository_context` remains available and tested as
+a one-shot "persist an already-fully-assembled RepositoryContext"
+utility, just no longer on the live ingestion path.
 
 ### Migrations
 
@@ -474,7 +474,7 @@ fresh, file-backed SQLite database per test, created from
 fast and dependency-free); the Alembic migration itself is verified
 separately (see above), not by the pytest suite.
 
-## REST API Layer (Phase 10 — implemented)
+## REST API Layer (Phase 10 — implemented; ingestion made asynchronous in Phase 11)
 
 `app/api/v1/routes/repositories.py`, mounted under `/api/v1/repositories`
 via `app/api/v1/router.py`. Route handlers are thin: parse/validate the
@@ -486,47 +486,117 @@ layer itself.
 
 | Method & path | Purpose |
 |---|---|
-| `POST /api/v1/repositories/github` | Ingest a repository: `{repository_url, branch?}` -> runs the full pipeline (Phase 4-9) synchronously and returns the result. |
-| `GET /api/v1/repositories` | Paginated list (`page`, `page_size` query params), newest-updated first. |
-| `GET /api/v1/repositories/{id}` | Repository detail + its latest `AnalysisRun` summary. |
+| `POST /api/v1/repositories/github` | Enqueue ingestion of a repository: `{repository_url, branch?}` -> `202` immediately with `status: "QUEUED"`; the pipeline runs as a background job (Phase 11). |
+| `GET /api/v1/repositories` | Paginated list (`page`, `page_size` query params), newest-updated first; each item's `latest_status` reflects live progress. |
+| `GET /api/v1/repositories/{id}` | Repository detail + its latest `AnalysisRun` summary (live status) — the "reuse GET /repositories/{id} for polling" option from the Phase 11 plan. |
+| `GET /api/v1/repositories/{id}/analysis-runs/{run_id}` | Poll one specific ingestion run's live status — the dedicated status-polling endpoint from the Phase 11 plan; unlike the endpoint above, this is unambiguous even if a second ingestion/refresh has started since. |
 | `GET /api/v1/repositories/{id}/branches` | The repository's currently known branches (default branch first). |
 | `GET /api/v1/repositories/{id}/profile` | The Repository Profile view (Phase 8's `build_repository_profile()`) from the latest **READY** analysis run. |
 | `GET /api/v1/repositories/{id}/commits` | Paginated commit history, newest first. |
-| `POST /api/v1/repositories/{id}/refresh` | Re-run ingestion for an already-known repository (optionally with a different `branch`); adds a new `AnalysisRun`, doesn't duplicate the `Repository` row. |
+| `POST /api/v1/repositories/{id}/refresh` | Enqueue re-ingestion of an already-known repository (optionally with a different `branch`) — same `202`/background-job behavior as `.../github`; adds a new `AnalysisRun`, doesn't duplicate the `Repository` row. |
 
-All five endpoints are registered and appear in the generated OpenAPI
-schema (`/docs`, `/openapi.json`) with request/response models and
+All endpoints are registered and appear in the generated OpenAPI schema
+(`/docs`, `/openapi.json`) with request/response models and
 per-status-code descriptions (see `responses=` on each route).
 
-### Ingestion orchestration
+### Public status vocabulary (Phase 11)
 
-`app/services/ingestion_orchestrator.py::ingest_github_repository(db,
-settings, repository_url, branch)` is what `POST .../github` calls: it
-chains everything built in Phases 4-9 --
-`parse_github_url` -> resolve provider -> `fetch_metadata` ->
-`list_branches` + `select_branch` -> `get_commit_history` +
-`get_languages` -> `clone` -> `assemble_repository_context` (Phase 8) ->
-`persist_repository_context` (Phase 9) — synchronously, in the request.
-`refresh_repository_ingestion(db, settings, repository_id, branch)` looks
-up the repository's stored `source_url` and calls the same function, so
-"refresh" is just "ingest again."
+`app/api/v1/status_mapping.py::to_public_status()` maps the internal,
+persisted `IngestionStatus` (`PENDING, VALIDATING, FETCHING_METADATA,
+FETCHING_BRANCHES, CLONING, SCANNING, READY, FAILED` — unchanged since
+Phase 3/9) to the coarser vocabulary named in the Phase 11 plan:
 
-A malformed/unsupported URL raises before anything is constructed or
-persisted (`parse_github_url` runs first). Once the URL is valid, every
-further failure (repo not found, branch not found, rate limited, clone
-failed, ...) is caught, attached to the `RepositoryContext` via
-`context.fail(...)`, and **still persisted** as a `FAILED` `AnalysisRun` —
-so `POST .../github` normally returns `201` either way, with `status`
-in the body telling you which (`READY` or `FAILED`, plus `error_code`/
-`error_message` when failed). This mirrors how Phase 11's asynchronous
-version will behave (a job is accepted; you poll `status`), so Phase 11
-only needs to change *when* the response is available, not its shape.
+| Internal (`AnalysisRun.status`, DB) | Public (every API response) |
+|---|---|
+| `PENDING` | `QUEUED` |
+| `VALIDATING` | `VALIDATING` |
+| `FETCHING_METADATA`, `FETCHING_BRANCHES` | `FETCHING` |
+| `CLONING` | `CLONING` |
+| `SCANNING` | `ANALYZING` |
+| `READY` | `READY` |
+| `FAILED` | `FAILED` |
 
-`select_branch(branches, requested_branch)` (a new pure function
-extracted from Phase 6's `resolve_branch`, which still fetches its own
-branch list and delegates to it) lets the orchestrator reuse the branch
-list it already needs for `RepositoryContext.branches` instead of an
-extra network call.
+Purely a presentation-layer mapping applied when serializing a response
+(`_to_summary`, `_to_ingest_response`, `_to_latest_analysis_run`, the
+`/analysis-runs/{run_id}` and `/profile` endpoints) — it never changes
+what's stored or how `app/db/repository_dao.py::transition_analysis_run`
+validates a transition; Phase 9's `ALLOWED_TRANSITIONS` enforcement is
+untouched. `FETCHING_METADATA`/`FETCHING_BRANCHES` collapse to one public
+value because both are "talking to GitHub's API"; `SCANNING` reads as
+`ANALYZING` because that's a better name for what Phase 8 actually does
+there (scan the tree, detect languages/tests, compute evolution signals).
+
+### Asynchronous ingestion orchestration (Phase 11)
+
+`app/services/ingestion_orchestrator.py` is now split into two halves,
+matching how FastAPI's `BackgroundTasks` work:
+
+- **`enqueue_ingestion(db, settings, repository_url, branch)`** /
+  **`enqueue_refresh(db, settings, repository_id, branch)`** — fast and
+  synchronous, run inside the request. Validate the URL (`parse_github_url`
+  — raises before anything is persisted, so a malformed/unsupported URL
+  still fails with nothing recorded, same as Phase 10), upsert a minimal
+  `Repository` row, create a `PENDING` `AnalysisRun`, and return
+  immediately. This is genuinely all the request does — cloning, scanning,
+  and every other slow step happen after the response is already on its
+  way back, so the frontend is never blocked regardless of repository
+  size (the actual "long-running ingestion never blocks the frontend"
+  goal of this phase).
+- **`run_ingestion_job(run_id, settings, session_factory)`** — the real
+  pipeline: `fetch_metadata` -> `list_branches` + `select_branch` ->
+  `get_commit_history` + `get_languages` -> `clone` ->
+  `assemble_repository_context` (Phase 8). Run as a FastAPI `BackgroundTask`
+  (`background_tasks.add_task(...)`, no new queue/broker dependency —
+  there was no existing one in this project per the Phase 1 audit, and
+  `BackgroundTasks` is already part of the Starlette/FastAPI stack this
+  app runs on). It opens its **own** DB session via an injected
+  `session_factory` (see `app/db/session.py::get_session_factory`) rather
+  than the request's — that session is already closed by the time a
+  background task runs (FastAPI closes `Depends(get_db)`'s session after
+  background tasks complete, and by then the response has already been
+  sent, so reusing it would serve no purpose and risks holding a
+  connection open across a slow clone).
+
+  Crucially, `run_ingestion_job` transitions `AnalysisRun.status`
+  **live** at each stage boundary — `_advance(db, run, context, status)`
+  calls `transition_analysis_run` (Phase 9) and commits *before* that
+  stage's real work runs, exactly mirroring the in-memory
+  `RepositoryContext.transition_to` call right next to it. This is the
+  core difference from Phase 10's version, which built the whole
+  `RepositoryContext` first and persisted the outcome once at the end —
+  correct, but not truly live: a concurrent poll mid-ingestion would have
+  seen only `PENDING` the whole time, which is exactly the "simulated
+  progress bar" this phase's goal explicitly rules out. A concurrent poll
+  now observes each real stage the moment it starts, and only after the
+  previous stage's actual work has finished — verified directly in
+  `tests/test_ingestion_job.py` by having a recording provider read the
+  run's *persisted* status (via a separate DB session) at the instant each
+  of its methods is called.
+
+  `assemble_repository_context` (Phase 8) still owns its own
+  `CLONING -> SCANNING -> READY/FAILED` transitions on the in-memory
+  context (unchanged contract) — `run_ingestion_job` mirrors only the
+  `SCANNING` entry to the DB itself (there's no hook into Phase 8 to mirror
+  its internal transitions one-for-one), then reads back
+  `context.analysis_status` afterward to decide whether to call
+  `complete_analysis_run` or `fail_analysis_run`.
+
+  Any `RepositoryIntegrationError` raised before `assemble_repository_context`
+  (metadata fetch, branch resolution, clone) is caught and turns into a
+  `FAILED` `AnalysisRun` with the structured error attached — never a
+  silent hang; `completed_at` is always set on the terminal transition, so
+  "did this job finish" is always answerable by polling.
+  `select_branch(branches, requested_branch)` (a pure function extracted
+  from Phase 6's `resolve_branch`, which still fetches its own branch list
+  and delegates to it) lets the job reuse the branch list it already needs
+  for `RepositoryContext.branches` instead of an extra network call.
+
+  `persist_repository_context` (Phase 9) is **not** used by the live job
+  above — replaying the full transition sequence after the fact is exactly
+  what Phase 11 replaces with live tracking. It's kept as-is (still
+  correct, still tested by `tests/test_ingestion_persistence.py`) as a
+  lower-level, still-useful capability: given an already-fully-assembled
+  `RepositoryContext` from any source, persist it in one shot.
 
 ### Structured errors
 
@@ -535,7 +605,7 @@ for `RepositoryIntegrationError` (the common base every domain error in
 `app/domain/errors.py` extends) that renders `exc.to_dict()`
 (`{"code", "message"}`) with a status code looked up from a fixed
 code -> status table — no raw exception, stack trace, or GitHub payload
-ever reaches an HTTP response. Two error codes are new in Phase 10:
+ever reaches an HTTP response. Two error codes were added in Phase 10:
 
 | Code | HTTP status | Raised by |
 |---|---|---|
@@ -549,25 +619,41 @@ pattern as `github_token`) — unset (default) means no auth is enforced,
 matching this project's local-dev-friendly stance from Phase 0/1; there
 was no pre-existing user-auth convention in the codebase to extend, so
 this introduces the minimal one. When set, `POST .../github` and
-`POST .../{id}/refresh` (the two mutating/write endpoints) require
-`Authorization: Bearer <api_auth_token>`; the five read-only `GET`
-endpoints are never gated, configured or not.
+`POST .../{id}/refresh` (the two mutating/write endpoints, still fast/
+enqueue-only) require `Authorization: Bearer <api_auth_token>`; the
+read-only `GET` endpoints are never gated, configured or not.
 
 ### Testing
 
-`backend/tests/test_api_repositories.py` — real HTTP calls through
-`TestClient` against the actual FastAPI app (`app.db.session.get_db`
-overridden to a per-test SQLite database via the `api_client` fixture in
-`tests/conftest.py`; nothing else is mocked or bypassed), with `respx`
-faking the GitHub HTTP boundary and `app.services.github_provider.
-clone_repository` monkeypatched to a real local fixture tree (same
-patterns Phases 5-7's own tests already use) — so these exercise the
-real route -> orchestrator -> Phase 8 -> Phase 9 pipeline end-to-end.
-Covers: valid public repo ingestion (through to profile/branches/commits
-retrieval), invalid URL, unsupported host, branch selection, unknown
-branch (failed run persisted + surfaced via 409 on `/profile`), unknown
-repository (404), refresh (same repository, new analysis run),
-pagination, and auth required/not-required.
+- `backend/tests/test_api_repositories.py` — real HTTP calls through
+  `TestClient` against the actual FastAPI app (`app.db.session.get_db`
+  and `get_session_factory` both overridden to a per-test SQLite database
+  via the `api_client` fixture in `tests/conftest.py`; nothing else is
+  mocked or bypassed), with `respx` faking the GitHub HTTP boundary and
+  `app.services.github_provider.clone_repository` monkeypatched to a real
+  local fixture tree (same patterns Phases 5-7's own tests already use) —
+  so these exercise the real route -> orchestrator -> Phase 8 -> Phase 9
+  pipeline end-to-end. Starlette's `TestClient` runs `BackgroundTasks` to
+  completion as part of the same `client.post(...)` call (verified
+  directly — the *response body* reflects state from before the
+  background task ran, i.e. `status: "QUEUED"`, but the database is fully
+  updated by the time `client.post()` returns), so tests call `POST` once
+  and then issue a follow-up `GET` to observe the real final state, with
+  no sleep/poll loop needed. Covers: valid public repo ingestion (through
+  to profile/branches/commits retrieval), invalid URL, unsupported host,
+  branch selection, unknown branch (failed run persisted + surfaced via
+  409 on `/profile`), unknown repository/run (404), refresh (same
+  repository, new analysis run), pagination, and auth required/not-required.
+- `backend/tests/test_ingestion_job.py` — direct tests of
+  `run_ingestion_job` (no HTTP layer), using a recording `RepositoryProvider`
+  registered under a throwaway hostname whose methods read the run's
+  *persisted* status through a separate DB session at the instant each is
+  called. Directly proves the two things this phase's plan asks for:
+  status transitions happen in the correct order and only after the prior
+  stage's real work has completed (not a replay), and a failure mid-
+  pipeline (during `clone`, and separately during `fetch_metadata`)
+  surfaces `FAILED` with the structured error and a set `completed_at` —
+  not a silent hang.
 
 ## Authentication
 
@@ -636,12 +722,19 @@ Every code above maps to an HTTP status via a single table in
 
 - Only `GitHubProvider` is implemented; `LocalRepositoryProvider` and
   `GitLabProvider` are named in the abstraction but not implemented.
-- Ingestion (`POST /api/v1/repositories/github` and `.../refresh`) runs
-  synchronously inside the HTTP request -- for a large repository this
-  means a slow response, not a queued job with live progress. That's
-  Phase 11's job ("Asynchronous Status Tracking"); Phase 10's response
-  shape (`status` + `error_code`/`error_message` in the body) is designed
-  not to need to change when that lands, only *when* the response arrives.
+- Ingestion runs as a FastAPI `BackgroundTask` within the same server
+  process/worker (Phase 11) -- not a durable, separately-scaled job
+  queue (Celery/RQ/arq + a broker). A job in flight when the process
+  restarts or crashes is lost (its `AnalysisRun` stays stuck at whatever
+  status it last reached, never reaching `READY`/`FAILED`); there's no
+  retry, no persisted queue, and jobs don't survive past a single
+  worker's lifetime. This matches the "per existing app architecture"
+  instruction (there was no queue/broker in the project to build on --
+  see the Phase 1 audit) rather than introducing new infrastructure;
+  revisit if ingestion volume or reliability needs grow.
+- No cap on concurrent background ingestion jobs -- many simultaneous
+  `POST .../github` calls each spawn their own thread-pooled background
+  task and DB session; nothing currently limits how many run at once.
 - The initial migration was verified against SQLite only (no Postgres
   instance available in this environment); it uses no Postgres-specific
   types, but running it against a real Postgres instance is still

@@ -1,9 +1,13 @@
 """
-Pydantic request/response models for /api/v1/repositories (Phase 10).
+Pydantic request/response models for /api/v1/repositories (Phase 10,
+extended in Phase 11).
 
 Kept separate from the ORM models (app/models/) -- these describe the
 wire format, not the storage schema, and never expose a local filesystem
-path or a secret.
+path or a secret. Every `status` field here carries the public status
+vocabulary (QUEUED/VALIDATING/FETCHING/CLONING/ANALYZING/READY/FAILED,
+see app.api.v1.status_mapping.to_public_status), not the internal
+IngestionStatus values AnalysisRun.status is persisted as.
 """
 
 from __future__ import annotations
@@ -23,6 +27,11 @@ class RefreshRepositoryRequest(BaseModel):
 
 
 class IngestRepositoryResponse(BaseModel):
+    """Returned immediately on enqueue (Phase 11) -- status is QUEUED and
+    selected_branch/commit_sha are still null at this point (not resolved
+    yet); poll analysis_run_id via GET .../analysis-runs/{id} or GET
+    .../{repository_id} for live progress."""
+
     repository_id: str
     provider: str
     source_url: str
@@ -34,6 +43,18 @@ class IngestRepositoryResponse(BaseModel):
     analysis_run_id: str
     error_code: str | None = None
     error_message: str | None = None
+
+
+class AnalysisRunStatus(BaseModel):
+    id: str
+    repository_id: str
+    status: str
+    branch_name: str | None
+    commit_sha: str | None
+    error_code: str | None
+    error_message: str | None
+    started_at: datetime
+    completed_at: datetime | None
 
 
 class RepositorySummary(BaseModel):

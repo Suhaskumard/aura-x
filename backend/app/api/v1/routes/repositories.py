@@ -1,34 +1,41 @@
 """
 /api/v1/repositories -- ingestion, browsing, and profile endpoints
-(Phase 10). Route handlers only: parse/validate the request, call a
-service, shape the response. Structured errors from services propagate
-as RepositoryIntegrationError and are translated to HTTP responses by
-app/api/v1/error_handlers.py -- handlers here never catch or reformat
-them.
+(Phase 10, made asynchronous in Phase 11). Route handlers only:
+parse/validate the request, call a service, shape the response.
+Structured errors from services propagate as RepositoryIntegrationError
+and are translated to HTTP responses by app/api/v1/error_handlers.py --
+handlers here never catch or reformat them.
+
+POST .../github and POST .../{id}/refresh enqueue an AnalysisRun and
+return 202 immediately (Phase 11) -- the actual pipeline runs as a
+BackgroundTask (app.services.ingestion_orchestrator.run_ingestion_job).
+Poll GET .../{id} or GET .../{id}/analysis-runs/{run_id} for live status.
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header, Query
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings, get_settings
 from app.db.repository_dao import (
     count_commits,
     count_repositories,
+    get_analysis_run,
     get_latest_analysis_run,
     get_repository_by_id,
     list_commits,
     list_repositories,
 )
-from app.db.session import get_db
+from app.db.session import get_db, get_session_factory
 from app.domain.errors import AnalysisNotReadyError, RepositoryNotFoundError, UnauthorizedError
 from app.domain.repository_context import IngestionStatus
 from app.models.analysis_run import AnalysisRun
 from app.models.repository import Repository
-from app.services.ingestion_orchestrator import ingest_github_repository, refresh_repository_ingestion
+from app.services.ingestion_orchestrator import enqueue_ingestion, enqueue_refresh, run_ingestion_job
 
 from app.api.v1.schemas import (
+    AnalysisRunStatus,
     BranchOut,
     CommitOut,
     ErrorResponse,
@@ -42,6 +49,7 @@ from app.api.v1.schemas import (
     RepositoryProfileResponse,
     RepositorySummary,
 )
+from app.api.v1.status_mapping import to_public_status
 
 router = APIRouter(prefix="/repositories", tags=["repositories"])
 
@@ -70,6 +78,15 @@ def _get_repository_or_404(db: Session, repository_id: str) -> Repository:
     return repository
 
 
+def _get_analysis_run_or_404(db: Session, repository_id: str, run_id: str) -> AnalysisRun:
+    run = get_analysis_run(db, run_id)
+    if run is None or run.repository_id != repository_id:
+        raise RepositoryNotFoundError(
+            f"No analysis run {run_id!r} for repository {repository_id!r}"
+        )
+    return run
+
+
 def _to_summary(repository: Repository, latest_run: AnalysisRun | None) -> RepositorySummary:
     return RepositorySummary(
         id=repository.id,
@@ -83,8 +100,21 @@ def _to_summary(repository: Repository, latest_run: AnalysisRun | None) -> Repos
         primary_language=repository.primary_language,
         stargazers_count=repository.stargazers_count,
         forks_count=repository.forks_count,
-        latest_status=latest_run.status if latest_run else None,
+        latest_status=to_public_status(latest_run.status) if latest_run else None,
         updated_at=repository.updated_at,
+    )
+
+
+def _to_latest_analysis_run(run: AnalysisRun) -> LatestAnalysisRun:
+    return LatestAnalysisRun(
+        id=run.id,
+        status=to_public_status(run.status),
+        branch_name=run.branch_name,
+        commit_sha=run.commit_sha,
+        error_code=run.error_code,
+        error_message=run.error_message,
+        started_at=run.started_at,
+        completed_at=run.completed_at,
     )
 
 
@@ -97,7 +127,7 @@ def _to_ingest_response(repository: Repository, run: AnalysisRun) -> IngestRepos
         owner=repository.owner,
         selected_branch=run.branch_name,
         commit_sha=run.commit_sha,
-        status=run.status,
+        status=to_public_status(run.status),
         analysis_run_id=run.id,
         error_code=run.error_code,
         error_message=run.error_message,
@@ -107,19 +137,20 @@ def _to_ingest_response(repository: Repository, run: AnalysisRun) -> IngestRepos
 @router.post(
     "/github",
     response_model=IngestRepositoryResponse,
-    status_code=201,
-    summary="Ingest a GitHub repository",
+    status_code=202,
+    summary="Enqueue ingestion of a GitHub repository",
     responses={**_INVALID_REQUEST, **_UNAUTHORIZED},
 )
 def ingest_github_repository_endpoint(
     payload: IngestRepositoryRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
+    session_factory: sessionmaker = Depends(get_session_factory),
     _auth: None = Depends(require_api_auth),
 ) -> IngestRepositoryResponse:
-    run = ingest_github_repository(
-        db, settings, repository_url=payload.repository_url, branch=payload.branch
-    )
+    run = enqueue_ingestion(db, settings, repository_url=payload.repository_url, branch=payload.branch)
+    background_tasks.add_task(run_ingestion_job, run.id, settings=settings, session_factory=session_factory)
     repository = get_repository_by_id(db, run.repository_id)
     return _to_ingest_response(repository, run)
 
@@ -139,7 +170,7 @@ def list_repositories_endpoint(
 @router.get(
     "/{repository_id}",
     response_model=RepositoryDetail,
-    summary="Get a repository's details and latest analysis run",
+    summary="Get a repository's details and latest analysis run (poll for live status)",
     responses={**_NOT_FOUND},
 )
 def get_repository_endpoint(repository_id: str, db: Session = Depends(get_db)) -> RepositoryDetail:
@@ -151,20 +182,31 @@ def get_repository_endpoint(repository_id: str, db: Session = Depends(get_db)) -
         license_name=repository.license_name,
         topics=repository.topics,
         open_issues_count=repository.open_issues_count,
-        latest_analysis_run=(
-            LatestAnalysisRun(
-                id=latest_run.id,
-                status=latest_run.status,
-                branch_name=latest_run.branch_name,
-                commit_sha=latest_run.commit_sha,
-                error_code=latest_run.error_code,
-                error_message=latest_run.error_message,
-                started_at=latest_run.started_at,
-                completed_at=latest_run.completed_at,
-            )
-            if latest_run
-            else None
-        ),
+        latest_analysis_run=_to_latest_analysis_run(latest_run) if latest_run else None,
+    )
+
+
+@router.get(
+    "/{repository_id}/analysis-runs/{run_id}",
+    response_model=AnalysisRunStatus,
+    summary="Poll the live status of one ingestion run",
+    responses={**_NOT_FOUND},
+)
+def get_analysis_run_status_endpoint(
+    repository_id: str, run_id: str, db: Session = Depends(get_db)
+) -> AnalysisRunStatus:
+    _get_repository_or_404(db, repository_id)
+    run = _get_analysis_run_or_404(db, repository_id, run_id)
+    return AnalysisRunStatus(
+        id=run.id,
+        repository_id=run.repository_id,
+        status=to_public_status(run.status),
+        branch_name=run.branch_name,
+        commit_sha=run.commit_sha,
+        error_code=run.error_code,
+        error_message=run.error_message,
+        started_at=run.started_at,
+        completed_at=run.completed_at,
     )
 
 
@@ -203,14 +245,14 @@ def get_repository_profile_endpoint(
         or latest_run.status != IngestionStatus.READY.value
         or latest_run.result_profile is None
     ):
-        status_hint = latest_run.status if latest_run is not None else "NONE"
+        status_hint = to_public_status(latest_run.status) if latest_run is not None else "NONE"
         raise AnalysisNotReadyError(
             f"No completed analysis available for repository {repository_id!r} (status={status_hint})"
         )
     return RepositoryProfileResponse(
         repository_id=repository.id,
         analysis_run_id=latest_run.id,
-        status=latest_run.status,
+        status=to_public_status(latest_run.status),
         profile=latest_run.result_profile,
         completed_at=latest_run.completed_at,
     )
@@ -249,17 +291,21 @@ def get_repository_commits_endpoint(
 @router.post(
     "/{repository_id}/refresh",
     response_model=IngestRepositoryResponse,
-    summary="Re-ingest an already-known repository",
+    status_code=202,
+    summary="Enqueue re-ingestion of an already-known repository",
     responses={**_NOT_FOUND, **_UNAUTHORIZED},
 )
 def refresh_repository_endpoint(
     repository_id: str,
+    background_tasks: BackgroundTasks,
     payload: RefreshRepositoryRequest | None = None,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
+    session_factory: sessionmaker = Depends(get_session_factory),
     _auth: None = Depends(require_api_auth),
 ) -> IngestRepositoryResponse:
     branch = payload.branch if payload is not None else None
-    run = refresh_repository_ingestion(db, settings, repository_id=repository_id, branch=branch)
+    run = enqueue_refresh(db, settings, repository_id=repository_id, branch=branch)
+    background_tasks.add_task(run_ingestion_job, run.id, settings=settings, session_factory=session_factory)
     repository = get_repository_by_id(db, run.repository_id)
     return _to_ingest_response(repository, run)

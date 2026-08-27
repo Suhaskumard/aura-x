@@ -11,6 +11,7 @@ and skips oversized or binary files.
 from __future__ import annotations
 
 import fnmatch
+import sys
 from pathlib import Path
 
 from app.domain.models import FileEntry
@@ -105,6 +106,33 @@ def _matches_gitignore(relative_path: str, patterns: list[str]) -> bool:
     return False
 
 
+def _long_path_safe(path: Path) -> Path:
+    """Resolve `path` to an absolute path that Windows can enumerate past
+    its default ~260-character MAX_PATH limit.
+
+    Without this, `Path.rglob()` on Windows silently stops descending into
+    (and returns zero entries for) any subtree whose path would exceed
+    MAX_PATH -- no exception, no partial-scan indicator, just missing
+    files. Real cloned repositories regularly nest deeper than that (e.g.
+    Java/Kotlin package trees, JS toolchain output, generated code),
+    especially once `settings.workspace_root` itself is a long path (as it
+    is by default: `<repo>/backend/.workspace/repositories/...`, longer
+    still under a synced folder like OneDrive). Prefixing with the `\\\\?\\`
+    extended-length namespace (Windows-only; a no-op everywhere else)
+    raises that limit to ~32,767 characters, matching what `git` itself
+    already tolerates when `core.longpaths` is enabled.
+    """
+    resolved = path.resolve()
+    if sys.platform != "win32":
+        return resolved
+    text = str(resolved)
+    if text.startswith("\\\\?\\"):
+        return resolved
+    if text.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + text[2:])
+    return Path("\\\\?\\" + text)
+
+
 def _looks_binary(path: Path, sniff_bytes: int = 8000) -> bool:
     try:
         with path.open("rb") as handle:
@@ -147,7 +175,7 @@ def scan_repository_tree(
     first few KB, or a known binary extension). Symlinks are skipped so a
     malicious repo can't point one outside the workspace.
     """
-    root_path = Path(root).resolve()
+    root_path = _long_path_safe(Path(root))
     if not root_path.is_dir():
         return []
 

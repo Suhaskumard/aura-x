@@ -1,4 +1,8 @@
+import os
+import sys
 from pathlib import Path
+
+import pytest
 
 from app.services.file_scanner import scan_repository_tree
 
@@ -96,3 +100,49 @@ def test_scan_is_deterministically_sorted(tmp_path):
 
     entries = scan_repository_tree(tmp_path)
     assert [e.relative_path for e in entries] == ["a.py", "b.py"]
+
+
+def _mkdir_long(path: Path) -> None:
+    r"""Create `path` and its parents even past Windows' default ~260-char
+    MAX_PATH. `Path.mkdir(parents=True)` and `os.makedirs` both mishandle
+    the `\\?\` extended-length prefix when given the full path in one
+    call (they split it back apart internally), so build it one level at
+    a time instead -- the same workaround `_long_path_safe()` in
+    file_scanner.py documents on the read side."""
+    if sys.platform != "win32":
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    current = path.drive + path.root
+    for part in path.parts[1:]:
+        current = os.path.join(current, part)
+        try:
+            os.mkdir("\\\\?\\" + current)
+        except FileExistsError:
+            pass
+
+
+def test_scan_finds_files_past_windows_max_path(tmp_path):
+    """A real cloned repository can easily nest deeper than Windows'
+    default 260-character MAX_PATH (Java/Kotlin package trees, JS
+    toolchain output, generated code -- more so once workspace_root's own
+    path is long, e.g. under a synced folder). Without _long_path_safe(),
+    Path.rglob() silently enumerates nothing for a subtree that deep: no
+    exception, no partial-scan indicator, just files missing from every
+    downstream result (language stats, dependencies, profile)."""
+    deep = tmp_path
+    while len(str(deep)) < 250:
+        deep = deep / ("segment_" + "0123456789" * 2)
+    try:
+        _mkdir_long(deep)
+    except OSError as exc:
+        pytest.skip(f"this environment does not support long paths: {exc}")
+
+    marker = deep / "deep_marker.py"
+    if sys.platform == "win32":
+        with open("\\\\?\\" + str(marker), "w", encoding="utf-8") as f:
+            f.write("print(1)\n")
+    else:
+        marker.write_text("print(1)\n", encoding="utf-8")
+
+    entries = scan_repository_tree(tmp_path)
+    assert any(e.relative_path.endswith("deep_marker.py") for e in entries)

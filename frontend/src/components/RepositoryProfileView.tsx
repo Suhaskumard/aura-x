@@ -35,16 +35,17 @@ export default function RepositoryProfileView({ repositoryId, onRefreshStarted }
         if (cancelled) return
         setProfile(profileResponse.profile)
         setBranches(branchList)
-        // Fall back through default_branch and the first branch returned so the
-        // <select>'s value always matches a real <option> -- an empty string here
-        // matches no option, which makes the browser display the first branch
-        // while React's own state still thinks nothing is selected.
-        setSelectedBranch(
-          profileResponse.profile.selected_branch ??
-            profileResponse.profile.default_branch ??
-            branchList[0]?.name ??
-            '',
-        )
+        // The <select>'s value must always match a real <option>, otherwise the
+        // browser silently displays the first branch while React state holds a
+        // name that no longer exists (a deleted/renamed branch, or a profile
+        // whose selected_branch/default_branch simply isn't in this list) --
+        // and "Re-analyze" would then POST the hidden, stale branch name.
+        const known = new Set(branchList.map((b) => b.name))
+        const preferred = [
+          profileResponse.profile.selected_branch,
+          profileResponse.profile.default_branch,
+        ].find((name): name is string => !!name && known.has(name))
+        setSelectedBranch(preferred ?? branchList[0]?.name ?? '')
       })
       .catch((err: unknown) => {
         if (cancelled) return

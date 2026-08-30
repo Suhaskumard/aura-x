@@ -14,12 +14,13 @@
 }
 
 .muted {
-  color: var(--text);
-  opacity: 0.8;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
 }
 
 .error-text {
   color: var(--danger);
+  overflow-wrap: anywhere;
 }
 
 .link-button {
@@ -84,9 +85,14 @@ button {
   border-radius: 8px;
   border: 1px solid var(--accent-border);
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   align-self: flex-start;
   margin-top: 8px;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--text-h);
+  outline-offset: 2px;
 }
 
 button:disabled {
@@ -122,12 +128,13 @@ button:not(:disabled):hover {
 
 .badge-progress {
   background: var(--accent-bg);
-  color: var(--accent);
+  /* darker than --accent so the label clears 4.5:1 on the 10% accent tint */
+  color: var(--accent-strong);
 }
 
 .badge-unknown {
   background: var(--code-bg);
-  color: var(--text);
+  color: var(--text-muted);
 }
 
 /* ---- Repository list/cards ---- */
@@ -137,12 +144,23 @@ button:not(:disabled):hover {
   margin: 0 0 24px;
   padding: 0;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  /* min(280px, 100%) so a viewport narrower than 280px (e.g. 320px minus the
+     app's 32px side padding == 256px) still gets a single column that fits,
+     instead of a fixed 280px track that forces horizontal page overflow. */
+  grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
   gap: 12px;
+}
+
+/* Grid/flex items default to min-width:auto, so a single long unbroken token
+   in a card (owner/name, a 300-char description) would otherwise stretch the
+   track past the viewport. */
+.repository-cards li {
+  min-width: 0;
 }
 
 .repository-card {
   width: 100%;
+  min-width: 0;
   text-align: left;
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -170,12 +188,55 @@ button:not(:disabled):hover {
   color: var(--text-h);
 }
 
+/* A long unbroken owner/name (or dependency/branch token) must wrap rather
+   than push a sibling out of the card or overflow the page. */
+.repository-card-title span:first-child {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
 .repository-card-meta {
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
   font-size: 13px;
-  color: var(--text);
-  opacity: 0.8;
+  color: var(--text-muted);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* dim (but keep) the current page while the next/previous page loads */
+.repository-cards[aria-busy='true'] {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+/* ---- Repository list pagination ---- */
+
+.pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.pagination-button {
+  margin-top: 0;
+  padding: 6px 12px;
+  background: none;
+  color: var(--accent);
+  border: 1px solid var(--accent-border);
+}
+
+.pagination-button:disabled {
+  color: var(--text-muted);
+  border-color: var(--border);
+}
+
+.pagination-status {
+  font-size: 13px;
+  color: var(--text-muted);
 }
 
 /* ---- Ingestion progress ---- */
@@ -210,8 +271,7 @@ button:not(:disabled):hover {
   display: flex;
   align-items: center;
   gap: 10px;
-  color: var(--text);
-  opacity: 0.6;
+  color: var(--text-muted);
 }
 
 .stage-dot {
@@ -259,6 +319,10 @@ button:not(:disabled):hover {
   gap: 12px;
 }
 
+.profile-header > div {
+  min-width: 0;
+}
+
 .profile-header h2 {
   margin: 0 0 4px;
 }
@@ -270,18 +334,22 @@ button:not(:disabled):hover {
   margin: 0;
 }
 
+.profile-facts div {
+  min-width: 0;
+}
+
 .profile-facts dt {
   font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
-  color: var(--text);
-  opacity: 0.7;
+  color: var(--text-muted);
 }
 
 .profile-facts dd {
   margin: 2px 0 0;
   color: var(--text-h);
   font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 .language-bars {
@@ -295,13 +363,16 @@ button:not(:disabled):hover {
 
 .language-bars li {
   display: grid;
-  grid-template-columns: 110px 1fr 48px;
+  grid-template-columns: minmax(0, 110px) 1fr 48px;
   align-items: center;
   gap: 10px;
+  min-width: 0;
 }
 
 .language-name {
   font-size: 14px;
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 
 .language-bar-track {
@@ -321,8 +392,7 @@ button:not(:disabled):hover {
 .language-pct {
   font-size: 13px;
   text-align: right;
-  color: var(--text);
-  opacity: 0.8;
+  color: var(--text-muted);
 }
 
 .pill-list {
@@ -340,6 +410,8 @@ button:not(:disabled):hover {
   background: var(--accent-bg);
   color: var(--accent);
   font-size: 13px;
+  overflow-wrap: anywhere;
+  max-width: 100%;
 }
 
 .pill-muted {
@@ -349,6 +421,7 @@ button:not(:disabled):hover {
 
 .reanalyze-controls {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: center;
 }
@@ -360,6 +433,8 @@ button:not(:disabled):hover {
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text-h);
+  min-width: 0;
+  max-width: 100%;
 }
 
 .reanalyze-controls button {

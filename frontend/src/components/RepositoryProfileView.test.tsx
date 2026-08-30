@@ -246,6 +246,45 @@ describe('RepositoryProfileView', () => {
     })
   })
 
+  it('never leaves the branch <select> on a value that is not one of its options (regression)', async () => {
+    // selected_branch is a real string, but the branch list does not contain
+    // it (branch deleted/renamed since the last run). The old code set state to
+    // 'main' anyway; the browser then displays the first <option> ('develop')
+    // while React state holds 'main', and "Re-analyze" POSTs the hidden name.
+    vi.mocked(getRepositoryProfile).mockResolvedValue(
+      makeResponse(makeProfile({ selected_branch: 'main', default_branch: 'main' })),
+    )
+    vi.mocked(getRepositoryBranches).mockResolvedValue([
+      { name: 'develop', head_commit_sha: 'b'.repeat(40), is_default: false },
+      { name: 'feature/x', head_commit_sha: 'c'.repeat(40), is_default: false },
+    ])
+    vi.mocked(refreshRepository).mockResolvedValue({
+      repository_id: 'repo-1',
+      analysis_run_id: 'run-2',
+      provider: 'github',
+      source_url: '',
+      name: '',
+      owner: '',
+      selected_branch: 'develop',
+      commit_sha: null,
+      status: 'QUEUED',
+      error_code: null,
+      error_message: null,
+    })
+    const user = userEvent.setup()
+    render(<RepositoryProfileView repositoryId="repo-1" onRefreshStarted={vi.fn()} />)
+
+    await screen.findByText('octocat/Hello-World')
+    const select = screen.getByRole('combobox') as HTMLSelectElement
+    const optionValues = [...select.options].map((o) => o.value)
+    expect(optionValues).toContain(select.value) // value must match a visible option
+    expect(select.value).toBe('develop')
+
+    // And the request must send exactly what the user sees selected.
+    await user.click(screen.getByRole('button', { name: /re-analyze this branch/i }))
+    await waitFor(() => expect(refreshRepository).toHaveBeenCalledWith('repo-1', 'develop'))
+  })
+
   it('formats zero-byte and megabyte-scale sizes correctly', async () => {
     vi.mocked(getRepositoryProfile).mockResolvedValue(
       makeResponse(makeProfile({ file_inventory: { total_files: 0, total_size_bytes: 0, by_category: {} } })),

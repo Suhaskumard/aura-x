@@ -1,16 +1,22 @@
 :root {
   --text: #6b6375;
+  /* Solid muted text colour that meets WCAG 2 AA (>= 4.5:1) on --bg. The old
+     approach (--text at opacity 0.8) rendered as ~#898291 == 3.7:1 and failed
+     for every .muted paragraph, card meta row, and profile fact label. */
+  --text-muted: #595563;
   --text-h: #08060d;
   --bg: #fff;
   --border: #e5e4e7;
   --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --success: #15803d;
-  --success-bg: rgba(21, 128, 61, 0.12);
-  --danger: #dc2626;
-  --danger-bg: rgba(220, 38, 38, 0.1);
+  --accent: #9a2bf0;
+  --accent-strong: #831dd4;
+  --on-accent: #fff;
+  --accent-bg: rgba(154, 43, 240, 0.1);
+  --accent-border: rgba(154, 43, 240, 0.5);
+  --success: #0e6330;
+  --success-bg: #e2ece6;
+  --danger: #c01c1c;
+  --danger-bg: rgba(192, 28, 28, 0.1);
   --social-bg: rgba(244, 243, 236, 0.5);
   --shadow:
     rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
@@ -37,11 +43,15 @@
 @media (prefers-color-scheme: dark) {
   :root {
     --text: #9ca3af;
+    --text-muted: #9ca3af;
     --text-h: #f3f4f6;
     --bg: #16171d;
     --border: #2e303a;
     --code-bg: #1f2028;
     --accent: #c084fc;
+    --accent-strong: #d8b4fe;
+    /* dark ink on the light-purple accent button: white was 2.64:1 */
+    --on-accent: #1a1030;
     --accent-bg: rgba(192, 132, 252, 0.15);
     --accent-border: rgba(192, 132, 252, 0.5);
     --success: #4ade80;
@@ -79,6 +89,8 @@ h2 {
   font-family: var(--heading);
   font-weight: 500;
   color: var(--text-h);
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 
 h1 {
@@ -116,4 +128,8 @@ code {
   line-height: 135%;
   padding: 4px 8px;
   background: var(--code-bg);
+  /* commit SHAs, branch names and error codes come straight from the backend
+     and can be arbitrarily long with no break opportunities */
+  overflow-wrap: anywhere;
+  min-width: 0;
 }

@@ -128,4 +128,36 @@ describe('IngestionProgress', () => {
     await flush()
     expect(getAnalysisRunStatus).toHaveBeenCalledWith('repo-1', 'run-2')
   })
+
+  it('exposes progress to assistive tech: aria-current on the active step, state in each label, a live status line', async () => {
+    vi.mocked(getAnalysisRunStatus).mockResolvedValue(run({ status: 'CLONING' }))
+    render(
+      <IngestionProgress repositoryId="repo-1" analysisRunId="run-1" onReady={vi.fn()} onFailed={vi.fn()} />,
+    )
+    await flush()
+
+    // Exactly one step is the current step, and it is the active one.
+    const current = screen.getAllByRole('listitem').filter((li) => li.getAttribute('aria-current') === 'step')
+    expect(current).toHaveLength(1)
+    expect(current[0]).toHaveClass('stage-active')
+    expect(current[0]).toHaveAccessibleName(/cloning .* in progress/i)
+
+    // Past and future steps carry their state in the accessible name too.
+    expect(screen.getByRole('listitem', { name: /queued .* completed/i })).toBeInTheDocument()
+    expect(screen.getByRole('listitem', { name: /analyzing .* not started/i })).toBeInTheDocument()
+
+    // A polite live region summarises the current stage for screen readers.
+    expect(screen.getByRole('status')).toHaveTextContent(/current stage: cloning — step 4 of 6/i)
+  })
+
+  it('announces terminal states through the status region', async () => {
+    vi.mocked(getAnalysisRunStatus).mockResolvedValue(
+      run({ status: 'FAILED', error_code: 'X', error_message: 'y' }),
+    )
+    render(
+      <IngestionProgress repositoryId="repo-1" analysisRunId="run-1" onReady={vi.fn()} onFailed={vi.fn()} />,
+    )
+    await flush()
+    expect(screen.getByText(/ingestion failed before it could finish/i)).toHaveAttribute('role', 'status')
+  })
 })

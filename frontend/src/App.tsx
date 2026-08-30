@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import './App.css'
 import { ApiError, getRepository, refreshRepository } from './api'
 import IngestionProgress from './components/IngestionProgress'
@@ -16,16 +16,24 @@ function App() {
   const [view, setView] = useState<View>({ kind: 'list' })
   const [refreshToken, setRefreshToken] = useState(0)
   const [selectError, setSelectError] = useState<string | null>(null)
+  // Monotonic id for the most recent repository-open request. A slower
+  // earlier getRepository() must not win a race against a later click (or
+  // against the user returning to the list), so every resolution checks
+  // it is still the newest before it navigates.
+  const selectSeqRef = useRef(0)
 
   function backToList() {
+    selectSeqRef.current += 1
     setView({ kind: 'list' })
     setRefreshToken((token) => token + 1)
   }
 
   async function handleSelectRepository(repositoryId: string) {
+    const seq = (selectSeqRef.current += 1)
     setSelectError(null)
     try {
       const detail = await getRepository(repositoryId)
+      if (seq !== selectSeqRef.current) return
       const run = detail.latest_analysis_run
       if (!run || run.status === 'READY') {
         setView({ kind: 'profile', repositoryId })
@@ -40,6 +48,7 @@ function App() {
         setView({ kind: 'progress', repositoryId, analysisRunId: run.id })
       }
     } catch (err) {
+      if (seq !== selectSeqRef.current) return
       setSelectError(err instanceof ApiError ? err.message : 'Could not open this repository.')
     }
   }

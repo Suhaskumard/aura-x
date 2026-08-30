@@ -15,6 +15,17 @@ function stageIndex(status: IngestionStatus | undefined): number {
   return STAGES.indexOf(status)
 }
 
+function label(stage: IngestionStatus): string {
+  return stage[0] + stage.slice(1).toLowerCase()
+}
+
+const STATE_WORDS: Record<string, string> = {
+  done: 'completed',
+  active: 'in progress',
+  pending: 'not started',
+  stalled: 'did not complete',
+}
+
 interface Props {
   repositoryId: string
   analysisRunId: string
@@ -51,7 +62,21 @@ export default function IngestionProgress({ repositoryId, analysisRunId, onReady
         <StatusBadge status={run?.status ?? null} />
       </div>
 
-      {error && <p className="error-text">Lost contact with the backend: {error}. Retrying…</p>}
+      {error && (
+        <p className="error-text" role="status">
+          Lost contact with the backend: {error}. Retrying…
+        </p>
+      )}
+
+      <p className="muted" role="status">
+        {failed
+          ? 'Ingestion failed before it could finish.'
+          : run?.status === 'READY'
+            ? 'Ingestion complete.'
+            : run?.status
+              ? `Current stage: ${label(run.status)} — step ${current + 1} of ${STAGES.length}.`
+              : 'Starting ingestion…'}
+      </p>
 
       <ol className="stage-list">
         {STAGES.map((stage, index) => {
@@ -63,9 +88,14 @@ export default function IngestionProgress({ repositoryId, analysisRunId, onReady
                 ? 'active'
                 : 'pending'
           return (
-            <li key={stage} className={`stage stage-${state}`}>
+            <li
+              key={stage}
+              className={`stage stage-${state}`}
+              aria-current={state === 'active' ? 'step' : undefined}
+              aria-label={`${label(stage)} — ${STATE_WORDS[state]}`}
+            >
               <span className="stage-dot" aria-hidden="true" />
-              <span className="stage-label">{stage[0] + stage.slice(1).toLowerCase()}</span>
+              <span className="stage-label">{label(stage)}</span>
             </li>
           )
         })}

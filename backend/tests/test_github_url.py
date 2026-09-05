@@ -91,3 +91,56 @@ def test_error_message_never_echoes_shell_metacharacters_unsafely():
         parse_github_url("https://github.com/owner/repo;rm -rf /")
     except InvalidRepositoryUrlError as exc:
         assert isinstance(exc.message, str)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://127.0.0.1/owner/repo",
+        "https://[::1]/owner/repo",
+        "https://0.0.0.0/owner/repo",
+        "https://xn--80ak6aa92e.com/owner/repo",  # IDN/punycode host, not github.com
+        "https://gіthub.com/owner/repo",  # Cyrillic 'і' homograph, not an ASCII match
+    ],
+)
+def test_non_github_hosts_rejected_as_unsupported(url):
+    with pytest.raises((InvalidRepositoryUrlError, UnsupportedRepositoryProviderError)):
+        parse_github_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com:443/owner/repo",
+        "https://github.com:8443/owner/repo",
+    ],
+)
+def test_explicit_port_does_not_bypass_host_validation(url):
+    # hostname allowlist check uses parsed.hostname, which excludes the port,
+    # so an explicit port must not change owner/repo extraction.
+    result = parse_github_url(url)
+    assert result.owner == "owner"
+    assert result.repository == "repo"
+
+
+def test_owner_repo_extraction_ignores_extra_path_segments():
+    result = parse_github_url("https://github.com/owner/repo/blob/main/some/file.py")
+    assert result.owner == "owner"
+    assert result.repository == "repo"
+
+
+def test_trailing_dot_host_rejected():
+    with pytest.raises((InvalidRepositoryUrlError, UnsupportedRepositoryProviderError)):
+        parse_github_url("https://github.com./owner/repo")
+
+
+def test_uppercase_host_is_accepted_case_insensitively():
+    result = parse_github_url("https://GITHUB.COM/owner/repo")
+    assert result.owner == "owner"
+    assert result.repository == "repo"
+
+
+@pytest.mark.parametrize("reserved", [".GIT", ".Git", "..", "."])
+def test_reserved_repo_names_rejected_case_insensitively(reserved):
+    with pytest.raises(InvalidRepositoryUrlError):
+        parse_github_url(f"https://github.com/owner/{reserved}")

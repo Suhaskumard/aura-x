@@ -182,3 +182,69 @@ def test_token_is_sent_as_bearer_header_when_configured():
     settings = Settings(github_token="super-secret-token")
     with GitHubApiClient(settings=settings) as client:
         assert client._client.headers["Authorization"] == "Bearer super-secret-token"
+
+
+@respx.mock
+def test_plain_429_without_rate_limit_headers_raises_rate_limited(fast_settings):
+    respx.get("https://api.github.com/repos/octocat/hello-world").mock(
+        return_value=httpx.Response(429, json={"message": "Too Many Requests"})
+    )
+    with GitHubApiClient(settings=fast_settings) as client:
+        with pytest.raises(RateLimitExceededError):
+            client.get_json("/repos/octocat/hello-world")
+
+
+@respx.mock
+def test_max_retries_zero_still_attempts_once(fast_settings):
+    settings = Settings(github_max_retries=0, github_request_timeout_seconds=1.0)
+    respx.get("https://api.github.com/repos/octocat/hello-world").mock(
+        return_value=httpx.Response(200, json={"id": 1})
+    )
+    with GitHubApiClient(settings=settings) as client:
+        payload = client.get_json("/repos/octocat/hello-world")
+    assert payload == {"id": 1}
+
+
+@respx.mock
+def test_retry_exhaustion_with_mixed_error_types_raises_final_error(fast_settings):
+    settings = Settings(github_max_retries=3, github_request_timeout_seconds=1.0)
+    route = respx.get("https://api.github.com/repos/octocat/hello-world")
+    route.side_effect = [
+        httpx.TimeoutException("timed out"),
+        httpx.Response(503, json={"message": "Service Unavailable"}),
+        httpx.Response(503, json={"message": "Service Unavailable"}),
+    ]
+    with GitHubApiClient(settings=settings) as client:
+        with pytest.raises(UpstreamUnavailableError):
+            client.get_json("/repos/octocat/hello-world")
+
+
+def test_backoff_seconds_grows_and_caps_at_two_seconds():
+    from app.services.github_client import _backoff_seconds
+
+    assert _backoff_seconds(1) == pytest.approx(0.2)
+    assert _backoff_seconds(2) == pytest.approx(0.4)
+    assert _backoff_seconds(3) == pytest.approx(0.8)
+    assert _backoff_seconds(10) == pytest.approx(2.0)
+    assert _backoff_seconds(20) == pytest.approx(2.0)
+
+
+@respx.mock
+def test_get_paginated_malformed_second_page_raises(fast_settings):
+    base_url = "https://api.github.com/repos/octocat/hello-world/commits"
+    page2_url = f"{base_url}?page=2"
+
+    respx.get(base_url, params={"per_page": "10"}).mock(
+        return_value=httpx.Response(
+            200,
+            json=[{"sha": "a"}],
+            headers={"Link": f'<{page2_url}>; rel="next"'},
+        )
+    )
+    respx.get(base_url, params={"page": "2"}).mock(
+        return_value=httpx.Response(200, json={"not": "a list"})
+    )
+
+    with GitHubApiClient(settings=fast_settings) as client:
+        with pytest.raises(MalformedUpstreamResponseError):
+            client.get_paginated("/repos/octocat/hello-world/commits", limit=10)

@@ -26,9 +26,12 @@ class Settings(BaseSettings):
     environment: str = Field(default="development")
     api_v1_prefix: str = "/api/v1"
 
-    # Database
+    # Database. Defaults to a local SQLite file for early development (per
+    # the project plan's own allowance); override via .env/DATABASE_URL to
+    # point at a real Postgres instance for production, e.g.
+    # "postgresql+psycopg://aurax:aurax@localhost:5432/aurax".
     database_url: str = Field(
-        default="postgresql+psycopg://aurax:aurax@localhost:5432/aurax",
+        default=f"sqlite:///{BACKEND_ROOT / '.workspace' / 'aurax.db'}",
     )
 
     # GitHub integration (backend-only secret; never returned to clients)
@@ -42,6 +45,15 @@ class Settings(BaseSettings):
     clone_timeout_seconds: int = Field(default=120)
     max_repository_size_mb: int = Field(default=500)
     max_commit_history: int = Field(default=200)
+
+    # Repository scanning (Phase 8)
+    scan_history_depth: int = Field(default=50)
+    max_scan_file_count: int = Field(default=50_000)
+
+    # Async ingestion (Phase 11): a run stuck in a non-terminal state for
+    # longer than this (e.g. a crashed background task) is force-failed
+    # the next time it's polled.
+    stuck_run_timeout_seconds: int = Field(default=600)
 
     def has_github_token(self) -> bool:
         return self.github_token is not None and bool(self.github_token.get_secret_value())

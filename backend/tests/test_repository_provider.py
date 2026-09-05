@@ -1,10 +1,23 @@
+import pytest
+
 from app.domain.models import BranchInfo, CloneResult, CommitInfo, RepositoryMetadata
 from app.domain.repository_provider import (
+    _PROVIDER_REGISTRY,
     RepositoryProvider,
     get_provider_class_for_host,
     register_provider,
     registered_hosts,
 )
+
+
+@pytest.fixture(autouse=True)
+def restore_registry():
+    """Snapshot/restore the module-level registry so tests that register
+    throwaway hosts can't leak state into other test files."""
+    snapshot = dict(_PROVIDER_REGISTRY)
+    yield
+    _PROVIDER_REGISTRY.clear()
+    _PROVIDER_REGISTRY.update(snapshot)
 
 
 class FakeProvider(RepositoryProvider):
@@ -67,3 +80,26 @@ def test_provider_registry_round_trip():
 
 def test_unregistered_host_returns_none():
     assert get_provider_class_for_host("not-a-registered-host.invalid") is None
+
+
+class OtherFakeProvider(FakeProvider):
+    name = "other-fake"
+
+
+def test_duplicate_registration_silently_overwrites():
+    # Documented behavior: register_provider() has no duplicate-registration
+    # guard, so re-registering a host silently replaces the previous class.
+    # Captured explicitly so a future guard/warning is a deliberate change.
+    register_provider("dup.test", FakeProvider)
+    register_provider("dup.test", OtherFakeProvider)
+    assert get_provider_class_for_host("dup.test") is OtherFakeProvider
+
+
+def test_host_lookup_case_insensitive_mixed_case():
+    register_provider("MixedCase.test", FakeProvider)
+    assert get_provider_class_for_host("mixedcase.TEST") is FakeProvider
+
+
+def test_host_lookup_does_not_treat_trailing_dot_as_equivalent():
+    register_provider("trailing.test", FakeProvider)
+    assert get_provider_class_for_host("trailing.test.") is None

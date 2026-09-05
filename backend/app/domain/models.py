@@ -64,3 +64,10 @@ class CloneResult:
     commit_sha: str
     branch: str
     cloned_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class EvolutionSignals:
+    commits_analyzed: int
+    file_churn: dict[str, int] = field(default_factory=dict)
+    co_change_counts: dict[tuple[str, str], int] = field(default_factory=dict)

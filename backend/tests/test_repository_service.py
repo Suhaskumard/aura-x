@@ -69,3 +69,37 @@ def test_resolve_branch_case_sensitive_branch_name():
     provider = make_provider()
     with pytest.raises(BranchNotFoundError):
         resolve_branch(provider, "octocat", "hello-world", "Main")
+
+
+def test_resolve_branch_raises_when_branches_list_is_completely_empty():
+    provider = StubProvider([])
+    with pytest.raises(BranchNotFoundError):
+        resolve_branch(provider, "octocat", "hello-world", None)
+    with pytest.raises(BranchNotFoundError):
+        resolve_branch(provider, "octocat", "hello-world", "main")
+
+
+def test_resolve_branch_empty_string_requested_is_not_treated_as_none():
+    provider = make_provider()
+    with pytest.raises(BranchNotFoundError):
+        resolve_branch(provider, "octocat", "hello-world", "")
+
+
+def test_resolve_branch_whitespace_only_branch_name_not_found():
+    provider = make_provider()
+    with pytest.raises(BranchNotFoundError):
+        resolve_branch(provider, "octocat", "hello-world", "   ")
+
+
+def test_resolve_branch_calls_list_branches_exactly_once():
+    calls = []
+    provider = make_provider()
+    original_list_branches = provider.list_branches
+
+    def counting_list_branches(owner, repo):
+        calls.append((owner, repo))
+        return original_list_branches(owner, repo)
+
+    provider.list_branches = counting_list_branches
+    resolve_branch(provider, "octocat", "hello-world", "develop")
+    assert len(calls) == 1

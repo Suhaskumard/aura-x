@@ -154,8 +154,125 @@ def test_get_languages_returns_dict(settings):
     assert languages == {"Python": 12345, "HTML": 678}
 
 
-def test_clone_not_implemented_until_phase_7(settings):
+def test_clone_builds_https_url_and_delegates_to_clone_service(settings, monkeypatch):
+    # The actual git subprocess mechanics are tested against real local
+    # repos in tests/test_clone_service.py. Here we only confirm
+    # GitHubProvider.clone() constructs the right URL and hands off
+    # correctly, without spawning a real subprocess.
+    captured = {}
+
+    def fake_run_git_clone(*, clone_url, branch, target_dir, settings):
+        captured["clone_url"] = clone_url
+        captured["branch"] = branch
+        captured["target_dir"] = target_dir
+        from datetime import datetime, timezone
+
+        from app.domain.models import CloneResult
+
+        return CloneResult(
+            local_path=str(target_dir),
+            commit_sha="deadbeef",
+            branch=branch,
+            cloned_at=datetime.now(timezone.utc),
+        )
+
+    monkeypatch.setattr(
+        "app.services.github_provider.clone_service.run_git_clone", fake_run_git_clone
+    )
+
     provider = make_provider(settings)
-    with pytest.raises(NotImplementedError):
-        provider.clone("octocat", "hello-world", "main", "/tmp/somewhere")
+    result = provider.clone("octocat", "hello-world", "main", "/tmp/somewhere")
+
+    assert captured["clone_url"] == "https://github.com/octocat/hello-world.git"
+    assert captured["branch"] == "main"
+    assert captured["target_dir"].name == "somewhere"
+    assert result.commit_sha == "deadbeef"
     provider.close()
+
+
+@respx.mock
+def test_list_branches_calls_fetch_metadata_internally(settings):
+    # Documented inefficiency: list_branches() re-fetches repository metadata
+    # (2 network calls total) purely to learn the default branch name. Not a
+    # correctness bug, but flagged so a future optimization can verify it
+    # actually reduces call count.
+    metadata_route = respx.get("https://api.github.com/repos/octocat/hello-world").mock(
+        return_value=httpx.Response(200, json=REPO_PAYLOAD)
+    )
+    respx.get("https://api.github.com/repos/octocat/hello-world/branches").mock(
+        return_value=httpx.Response(200, json=[{"name": "main", "commit": {"sha": "abc"}}])
+    )
+    with make_provider(settings) as provider:
+        provider.list_branches("octocat", "hello-world")
+    assert metadata_route.call_count == 1
+
+
+@respx.mock
+def test_fetch_metadata_missing_owner_and_license_keys_entirely(settings):
+    payload = dict(REPO_PAYLOAD)
+    payload.pop("owner")
+    payload.pop("license")
+    respx.get("https://api.github.com/repos/octocat/hello-world").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+    with make_provider(settings) as provider:
+        metadata = provider.fetch_metadata("octocat", "hello-world")
+    assert metadata.owner == ""
+    assert metadata.license_name is None
+
+
+@respx.mock
+def test_commit_with_no_parents(settings):
+    respx.get("https://api.github.com/repos/octocat/hello-world/commits").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "sha": "root",
+                    "commit": {"message": "root commit", "author": {}},
+                }
+            ],
+        )
+    )
+    with make_provider(settings) as provider:
+        commits = provider.get_commit_history("octocat", "hello-world", "main", limit=10)
+    assert commits[0].parents == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"null", b"[]", b'"not-a-dict"', b"42"],
+)
+@respx.mock
+def test_get_languages_non_dict_payload_returns_empty_dict(settings, body):
+    respx.get("https://api.github.com/repos/octocat/hello-world/languages").mock(
+        return_value=httpx.Response(200, content=body, headers={"Content-Type": "application/json"})
+    )
+    with make_provider(settings) as provider:
+        languages = provider.get_languages("octocat", "hello-world")
+    assert languages == {}
+
+
+def test_close_does_not_close_injected_client(settings):
+    injected_client = GitHubApiClient(settings=settings)
+    provider = GitHubProvider(settings=settings, client=injected_client)
+    provider.close()
+    # The injected client's underlying httpx.Client must still be usable
+    # (not closed) because the provider does not own it.
+    assert injected_client._client.is_closed is False
+    injected_client.close()
+
+
+def test_close_does_close_owned_client(settings):
+    provider = GitHubProvider(settings=settings)
+    owned_client = provider._client
+    provider.close()
+    assert owned_client._client.is_closed is True
+
+
+def test_parse_github_datetime_malformed_returns_none():
+    from app.services.github_provider import _parse_github_datetime
+
+    assert _parse_github_datetime("not-a-date") is None
+    assert _parse_github_datetime(None) is None
+    assert _parse_github_datetime("") is None

@@ -135,6 +135,13 @@ class GitHubApiClient:
                 raise RepositoryAccessDeniedError(
                     "GitHub access denied (private repository or insufficient token scope)"
                 )
+            if response.status_code == 429:
+                # GitHub's secondary rate limit (abuse detection) responds
+                # with 429, not 403, and does not always send the
+                # X-RateLimit-* headers used by _is_rate_limited().
+                raise RateLimitExceededError(
+                    f"GitHub API secondary rate limit exceeded, resets at {_rate_limit_reset_at(response)}"
+                )
             if response.status_code in _RETRYABLE_STATUS_CODES:
                 last_exc = None
                 if attempt >= max_attempts:

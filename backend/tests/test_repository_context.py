@@ -98,3 +98,59 @@ def test_context_never_carries_a_secret_field():
     forbidden_substrings = ("token", "secret", "password", "authorization")
     for key in payload:
         assert not any(s in key.lower() for s in forbidden_substrings)
+
+
+@pytest.mark.parametrize("terminal", [IngestionStatus.READY, IngestionStatus.FAILED])
+def test_fail_from_terminal_state_raises_instead_of_silently_succeeding(terminal):
+    ctx = make_context()
+    ctx.analysis_status = terminal
+    with pytest.raises(InvalidStateTransitionError):
+        ctx.fail({"code": "SOME_ERROR", "message": "boom"})
+    # last_error must remain untouched since the transition never happened
+    assert ctx.last_error is None
+
+
+def test_allowed_transitions_every_non_terminal_state_can_eventually_reach_ready():
+    from app.domain.repository_context import ALLOWED_TRANSITIONS
+
+    def can_reach_ready(start: IngestionStatus, seen: set[IngestionStatus]) -> bool:
+        if start == IngestionStatus.READY:
+            return True
+        if start in seen:
+            return False
+        seen.add(start)
+        return any(can_reach_ready(nxt, seen) for nxt in ALLOWED_TRANSITIONS[start])
+
+    for status in IngestionStatus:
+        if status in (IngestionStatus.READY, IngestionStatus.FAILED):
+            continue
+        assert can_reach_ready(status, set()), f"{status} cannot reach READY"
+
+
+def test_allowed_transitions_every_non_terminal_state_has_failed_edge():
+    from app.domain.repository_context import ALLOWED_TRANSITIONS
+
+    for status in IngestionStatus:
+        if status in (IngestionStatus.READY, IngestionStatus.FAILED):
+            continue
+        assert IngestionStatus.FAILED in ALLOWED_TRANSITIONS[status], f"{status} missing FAILED edge"
+
+
+def test_allowed_transitions_has_no_orphan_or_missing_states():
+    from app.domain.repository_context import ALLOWED_TRANSITIONS
+
+    assert set(ALLOWED_TRANSITIONS.keys()) == set(IngestionStatus)
+
+
+def test_to_dict_datetime_fields_remain_datetime_objects_not_iso_strings():
+    # Documented gap: to_dict() uses dataclasses.asdict(), which does not
+    # stringify datetime fields. A caller passing this straight to
+    # json.dumps() would get a TypeError. Captured explicitly so a future
+    # JSON-safe serializer change is deliberate.
+    ctx = make_context()
+    payload = ctx.to_dict()
+    assert isinstance(payload["created_at"], type(ctx.created_at))
+    with pytest.raises(TypeError):
+        import json
+
+        json.dumps(payload)

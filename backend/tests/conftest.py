@@ -1,14 +1,44 @@
 import os
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.config import Settings
+from app.db.base import Base
+from app.db.session import create_db_engine, get_db
 from app.main import app
 
 
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(app)
+
+
+@pytest.fixture
+def db_session(tmp_path: Path) -> Session:
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'test.db'}")
+    engine = create_db_engine(settings)
+    import app.models  # noqa: F401  (registers Repository/Branch/AnalysisRun)
+
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+    session = SessionLocal()
+    yield session
+    session.close()
+
+
+@pytest.fixture
+def client_with_db(db_session: Session) -> TestClient:
+    def _override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db, None)
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
